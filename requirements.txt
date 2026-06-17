@@ -1,0 +1,6 @@
+# Runtime dependencies for the MHC cause-list downloader
+# Pin minimum versions; Railway/Nixpacks will resolve the latest compatible release.
+
+requests>=2.32.0
+supabase>=2.10.0
+urllib3>=2.2.0

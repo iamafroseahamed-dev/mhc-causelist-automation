@@ -30,6 +30,14 @@ from supabase import Client, create_client
 # ---------------------------------------------------------------------------
 # Suppress InsecureRequestWarning – MHC uses a self-signed / mismatched cert
 # ---------------------------------------------------------------------------
+import os
+from supabase import create_client
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------

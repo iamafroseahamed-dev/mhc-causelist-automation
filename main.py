@@ -1,183 +1,37 @@
-import os
-import time
-import datetime
 import requests
 import urllib3
-import xml.etree.ElementTree as ET
-from supabase import create_client
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SUPABASE_URL = "https://iyohifpzsqjxcrgrtsza.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5b2hpZnB6c3FqeGNyZ3J0c3phIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTU4OTQ1MiwiZXhwIjoyMDk3MTY1NDUyfQ.BLz5-PeIc5TTjSAiYuWxnGgJYrVnqjh0RYwdirJn_50"
+session = requests.Session()
 
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": "https://hcmadras.tn.gov.in",
+    "Referer": "https://hcmadras.tn.gov.in/cause_list_mhc.php",
+    "X-Requested-With": "XMLHttpRequest",
+}
 
+payload = {
+    "cause_list_dt": "22-06-2026",
+    "court_no": "05",
+    "courtno_captcha": "983223",
+    "submit": "SEARCH"
+}
 
-def download_xml(url):
-    session = requests.Session()
+url = "https://hcmadras.tn.gov.in/cause_list_court.php"
 
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/xml,text/xml,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "close",
-        "Referer": "https://mhc.tn.gov.in/judis/clists/clists-madras/index.php",
-    })
+response = session.post(
+    url,
+    headers=headers,
+    data=payload,
+    timeout=(60, 180),
+    verify=False
+)
 
-    last_error = None
-
-    for attempt in range(1, 8):
-        try:
-            print(f"Download attempt {attempt}/7: {url}")
-
-            response = session.get(
-                url,
-                timeout=(180, 180),
-                verify=False,
-                allow_redirects=True
-            )
-
-            print("HTTP status:", response.status_code)
-            print("Content-Type:", response.headers.get("Content-Type"))
-
-            response.raise_for_status()
-
-            if not response.content or len(response.content) < 100:
-                raise Exception("Empty or invalid XML response")
-
-            return response.content
-
-        except Exception as error:
-            last_error = error
-            print(f"Attempt {attempt} failed:", error)
-
-            if attempt < 7:
-                time.sleep(30)
-
-    print("Failed to download XML after all retries.")
-    print("Last error:", last_error)
-    return None
-
-
-def chunk_list(items, size):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
-
-
-today = datetime.date.today()
-
-file_date = today.strftime("%d%m%Y")
-db_date = today.strftime("%Y-%m-%d")
-
-url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
-
-print("XML URL:", url)
-
-xml_content = download_xml(url)
-
-if not xml_content:
-    print("No XML downloaded. Existing data not deleted.")
-    exit(0)
-
-try:
-    root = ET.fromstring(xml_content)
-except ET.ParseError as error:
-    print("XML parsing failed:", error)
-    print("Existing data not deleted.")
-    exit(0)
-
-rows = []
-
-for court in root.findall(".//court"):
-    court_hall = court.findtext("courtno")
-    judge_name = court.findtext("judge1")
-
-    for stage in court.findall(".//stage"):
-        stage_name = stage.findtext("stagename")
-
-        for case in stage.findall(".//casedetails"):
-            case_type = case.findtext("mcasetype")
-            case_no = case.findtext("mcaseno")
-            case_year = case.findtext("mcaseyr")
-
-            case_number = None
-            if case_type and case_no and case_year:
-                case_number = f"{case_type}/{case_no}/{case_year}"
-
-            petitioner = case.findtext("pname")
-            respondent = case.findtext("rname")
-
-            rows.append({
-                "cause_date": db_date,
-                "source_type": "xml",
-                "source_url": url,
-                "court_name": "Madras High Court",
-                "bench": "Chennai",
-                "court_hall": court_hall,
-                "item_number": case.findtext("serial_no"),
-                "case_number": case_number,
-                "cnr_number": None,
-                "petitioner": petitioner,
-                "respondent": respondent,
-                "party_names": f"{petitioner or ''} vs {respondent or ''}",
-                "judge_name": judge_name,
-                "section": case_type,
-                "district": None,
-                "prayer": None,
-                "last_hearing_or_stage": stage_name,
-                "counsel_name": case.findtext("mpadv"),
-                "raw_text": ET.tostring(case, encoding="unicode"),
-                "raw_data": {
-                    "mcasetype": case_type,
-                    "mcaseno": case_no,
-                    "mcaseyr": case_year,
-                    "mpadv": case.findtext("mpadv"),
-                    "mradv": case.findtext("mradv"),
-                    "case_remarks": case.findtext("case_remarks"),
-                },
-                "import_status": "imported",
-                "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
-            })
-
-seen = {}
-
-for row in rows:
-    key = (
-        row["cause_date"],
-        row["court_hall"] or "",
-        row["item_number"] or "",
-        row["case_number"] or "",
-    )
-    seen[key] = row
-
-deduped_rows = list(seen.values())
-
-print("Parsed rows:", len(rows))
-print("Deduplicated rows:", len(deduped_rows))
-
-if not deduped_rows:
-    print("No rows found. Existing data not deleted.")
-    exit(0)
-
-print("Clearing today's records only...")
-
-supabase.table("daily_cause_list") \
-    .delete() \
-    .eq("cause_date", db_date) \
-    .execute()
-
-print("Today's old records cleared.")
-
-for batch in chunk_list(deduped_rows, 500):
-    supabase.table("daily_cause_list").upsert(
-        batch,
-        on_conflict="cause_date,court_hall,item_number,case_number"
-    ).execute()
-
-print("Inserted/Updated:", len(deduped_rows))
-print("Done.")
+print("Status:", response.status_code)
+print("Content-Type:", response.headers.get("Content-Type"))
+print(response.text[:2000])

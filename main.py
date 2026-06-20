@@ -14,31 +14,54 @@ SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdX
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-def download_xml(url, headers):
+def download_xml(url):
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/xml,text/xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+        "Referer": "https://mhc.tn.gov.in/judis/clists/clists-madras/index.php",
+    })
+
     last_error = None
 
-    for attempt in range(1, 6):
+    for attempt in range(1, 8):
         try:
-            print(f"Download attempt {attempt}/5: {url}")
+            print(f"Download attempt {attempt}/7: {url}")
 
-            response = requests.get(
+            response = session.get(
                 url,
-                headers=headers,
-                timeout=(30, 180),
-                verify=False
+                timeout=(180, 180),
+                verify=False,
+                allow_redirects=True
             )
 
+            print("HTTP status:", response.status_code)
+            print("Content-Type:", response.headers.get("Content-Type"))
+
             response.raise_for_status()
+
+            if not response.content or len(response.content) < 100:
+                raise Exception("Empty or invalid XML response")
+
             return response.content
 
-        except requests.exceptions.RequestException as error:
+        except Exception as error:
             last_error = error
-            print(f"Attempt {attempt} failed: {error}")
+            print(f"Attempt {attempt} failed:", error)
 
-            if attempt < 5:
-                time.sleep(20)
+            if attempt < 7:
+                time.sleep(30)
 
-    raise last_error
+    print("Failed to download XML after all retries.")
+    print("Last error:", last_error)
+    return None
 
 
 def chunk_list(items, size):
@@ -53,16 +76,20 @@ db_date = today.strftime("%Y-%m-%d")
 
 url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
 
-headers = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/xml,text/xml,*/*",
-    "Referer": "https://mhc.tn.gov.in/judis/clists/clists-madras/index.php"
-}
+print("XML URL:", url)
 
-print("Downloading XML:", url)
+xml_content = download_xml(url)
 
-xml_content = download_xml(url, headers)
-root = ET.fromstring(xml_content)
+if not xml_content:
+    print("No XML downloaded. Existing data not deleted.")
+    exit(0)
+
+try:
+    root = ET.fromstring(xml_content)
+except ET.ParseError as error:
+    print("XML parsing failed:", error)
+    print("Existing data not deleted.")
+    exit(0)
 
 rows = []
 
@@ -85,7 +112,7 @@ for court in root.findall(".//court"):
             petitioner = case.findtext("pname")
             respondent = case.findtext("rname")
 
-            row = {
+            rows.append({
                 "cause_date": db_date,
                 "source_type": "xml",
                 "source_url": url,
@@ -115,9 +142,7 @@ for court in root.findall(".//court"):
                 },
                 "import_status": "imported",
                 "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
-            }
-
-            rows.append(row)
+            })
 
 seen = {}
 
@@ -135,22 +160,24 @@ deduped_rows = list(seen.values())
 print("Parsed rows:", len(rows))
 print("Deduplicated rows:", len(deduped_rows))
 
-print("Clearing today's daily_cause_list records...")
+if not deduped_rows:
+    print("No rows found. Existing data not deleted.")
+    exit(0)
+
+print("Clearing today's records only...")
 
 supabase.table("daily_cause_list") \
     .delete() \
     .eq("cause_date", db_date) \
     .execute()
 
-print("Today's records cleared.")
+print("Today's old records cleared.")
 
-if deduped_rows:
-    for batch in chunk_list(deduped_rows, 500):
-        supabase.table("daily_cause_list").upsert(
-            batch,
-            on_conflict="cause_date,court_hall,item_number,case_number"
-        ).execute()
+for batch in chunk_list(deduped_rows, 500):
+    supabase.table("daily_cause_list").upsert(
+        batch,
+        on_conflict="cause_date,court_hall,item_number,case_number"
+    ).execute()
 
-print("XML URL:", url)
 print("Inserted/Updated:", len(deduped_rows))
 print("Done.")

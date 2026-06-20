@@ -1,3 +1,8 @@
+<<<<<<< HEAD
+=======
+import os
+import time
+>>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
 import datetime
 import requests
 import urllib3
@@ -9,6 +14,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SUPABASE_URL = "https://iyohifpzsqjxcrgrtsza.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5b2hpZnB6c3FqeGNyZ3J0c3phIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTU4OTQ1MiwiZXhwIjoyMDk3MTY1NDUyfQ.BLz5-PeIc5TTjSAiYuWxnGgJYrVnqjh0RYwdirJn_50"
 
+<<<<<<< HEAD
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -53,6 +59,87 @@ if res.status_code == 404:
 res.raise_for_status()
 
 root = ET.fromstring(res.content)
+=======
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def download_xml(url):
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/xml,text/xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+        "Referer": "https://mhc.tn.gov.in/judis/clists/clists-madras/index.php",
+    })
+
+    last_error = None
+
+    for attempt in range(1, 8):
+        try:
+            print(f"Download attempt {attempt}/7: {url}")
+
+            response = session.get(
+                url,
+                timeout=(180, 180),
+                verify=False,
+                allow_redirects=True
+            )
+
+            print("HTTP status:", response.status_code)
+            print("Content-Type:", response.headers.get("Content-Type"))
+
+            response.raise_for_status()
+
+            if not response.content or len(response.content) < 100:
+                raise Exception("Empty or invalid XML response")
+
+            return response.content
+
+        except Exception as error:
+            last_error = error
+            print(f"Attempt {attempt} failed:", error)
+
+            if attempt < 7:
+                time.sleep(30)
+
+    print("Failed to download XML after all retries.")
+    print("Last error:", last_error)
+    return None
+
+
+def chunk_list(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+today = datetime.date.today()
+
+file_date = today.strftime("%d%m%Y")
+db_date = today.strftime("%Y-%m-%d")
+
+url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
+
+print("XML URL:", url)
+
+xml_content = download_xml(url)
+
+if not xml_content:
+    print("No XML downloaded. Existing data not deleted.")
+    exit(0)
+
+try:
+    root = ET.fromstring(xml_content)
+except ET.ParseError as error:
+    print("XML parsing failed:", error)
+    print("Existing data not deleted.")
+    exit(0)
+>>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
 
 rows = []
 
@@ -75,7 +162,11 @@ for court in root.findall(".//court"):
             petitioner = case.findtext("pname")
             respondent = case.findtext("rname")
 
+<<<<<<< HEAD
             row = {
+=======
+            rows.append({
+>>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
                 "cause_date": db_date,
                 "source_type": "xml",
                 "source_url": url,
@@ -87,7 +178,11 @@ for court in root.findall(".//court"):
                 "cnr_number": None,
                 "petitioner": petitioner,
                 "respondent": respondent,
+<<<<<<< HEAD
                 "party_names": f"{petitioner} vs {respondent}",
+=======
+                "party_names": f"{petitioner or ''} vs {respondent or ''}",
+>>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
                 "judge_name": judge_name,
                 "section": case_type,
                 "district": None,
@@ -105,9 +200,13 @@ for court in root.findall(".//court"):
                 },
                 "import_status": "imported",
                 "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+<<<<<<< HEAD
             }
 
             rows.append(row)
+=======
+            })
+>>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
 
 seen = {}
 
@@ -125,6 +224,7 @@ deduped_rows = list(seen.values())
 print("Parsed rows:", len(rows))
 print("Deduplicated rows:", len(deduped_rows))
 
+<<<<<<< HEAD
 if deduped_rows:
     supabase.table("daily_cause_list").upsert(
         deduped_rows,
@@ -134,3 +234,26 @@ if deduped_rows:
 print("XML URL:", url)
 print("Inserted/Updated:", len(deduped_rows))
 print("Done.")
+=======
+if not deduped_rows:
+    print("No rows found. Existing data not deleted.")
+    exit(0)
+
+print("Clearing today's records only...")
+
+supabase.table("daily_cause_list") \
+    .delete() \
+    .eq("cause_date", db_date) \
+    .execute()
+
+print("Today's old records cleared.")
+
+for batch in chunk_list(deduped_rows, 500):
+    supabase.table("daily_cause_list").upsert(
+        batch,
+        on_conflict="cause_date,court_hall,item_number,case_number"
+    ).execute()
+
+print("Inserted/Updated:", len(deduped_rows))
+print("Done.")
+>>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00

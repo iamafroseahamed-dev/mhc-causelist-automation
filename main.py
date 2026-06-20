@@ -19,7 +19,7 @@ today = datetime.date.today()
 file_date = today.strftime("%d%m%Y")
 db_date = today.strftime("%Y-%m-%d")
 
-url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
+url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_22062026.xml"
 
 headers = {
     "User-Agent": "Mozilla/5.0",

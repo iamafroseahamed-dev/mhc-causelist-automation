@@ -1,8 +1,5 @@
-<<<<<<< HEAD
-=======
 import os
 import time
->>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
 import datetime
 import requests
 import urllib3
@@ -14,7 +11,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SUPABASE_URL = "https://iyohifpzsqjxcrgrtsza.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5b2hpZnB6c3FqeGNyZ3J0c3phIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTU4OTQ1MiwiZXhwIjoyMDk3MTY1NDUyfQ.BLz5-PeIc5TTjSAiYuWxnGgJYrVnqjh0RYwdirJn_50"
 
-<<<<<<< HEAD
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -32,36 +28,6 @@ file_date = today.strftime("%d%m%Y")
 db_date = today.strftime("%Y-%m-%d")
 
 url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
-
-headers = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/xml,text/xml,*/*",
-    "Referer": "https://mhc.tn.gov.in/judis/clists/clists-madras/index.php"
-}
-
-print("Clearing daily_cause_list table...")
-
-supabase.table("daily_cause_list") \
-    .delete() \
-    .neq("id", "00000000-0000-0000-0000-000000000000") \
-    .execute()
-
-print("Table cleared.")
-
-print("Downloading XML:", url)
-
-res = requests.get(url, headers=headers, timeout=60, verify=False)
-
-if res.status_code == 404:
-    print(f"No cause list published for {db_date} (HTTP 404). Skipping import.")
-    exit(0)
-
-res.raise_for_status()
-
-root = ET.fromstring(res.content)
-=======
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
 
 def download_xml(url):
     session = requests.Session()
@@ -118,13 +84,6 @@ def chunk_list(items, size):
         yield items[i:i + size]
 
 
-today = datetime.date.today()
-
-file_date = today.strftime("%d%m%Y")
-db_date = today.strftime("%Y-%m-%d")
-
-url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
-
 print("XML URL:", url)
 
 xml_content = download_xml(url)
@@ -139,7 +98,6 @@ except ET.ParseError as error:
     print("XML parsing failed:", error)
     print("Existing data not deleted.")
     exit(0)
->>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
 
 rows = []
 
@@ -162,11 +120,7 @@ for court in root.findall(".//court"):
             petitioner = case.findtext("pname")
             respondent = case.findtext("rname")
 
-<<<<<<< HEAD
-            row = {
-=======
             rows.append({
->>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
                 "cause_date": db_date,
                 "source_type": "xml",
                 "source_url": url,
@@ -178,11 +132,7 @@ for court in root.findall(".//court"):
                 "cnr_number": None,
                 "petitioner": petitioner,
                 "respondent": respondent,
-<<<<<<< HEAD
-                "party_names": f"{petitioner} vs {respondent}",
-=======
                 "party_names": f"{petitioner or ''} vs {respondent or ''}",
->>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
                 "judge_name": judge_name,
                 "section": case_type,
                 "district": None,
@@ -200,13 +150,7 @@ for court in root.findall(".//court"):
                 },
                 "import_status": "imported",
                 "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
-<<<<<<< HEAD
-            }
-
-            rows.append(row)
-=======
             })
->>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00
 
 seen = {}
 
@@ -224,17 +168,6 @@ deduped_rows = list(seen.values())
 print("Parsed rows:", len(rows))
 print("Deduplicated rows:", len(deduped_rows))
 
-<<<<<<< HEAD
-if deduped_rows:
-    supabase.table("daily_cause_list").upsert(
-        deduped_rows,
-        on_conflict="cause_date,court_hall,item_number,case_number"
-    ).execute()
-
-print("XML URL:", url)
-print("Inserted/Updated:", len(deduped_rows))
-print("Done.")
-=======
 if not deduped_rows:
     print("No rows found. Existing data not deleted.")
     exit(0)
@@ -256,4 +189,3 @@ for batch in chunk_list(deduped_rows, 500):
 
 print("Inserted/Updated:", len(deduped_rows))
 print("Done.")
->>>>>>> a24eaa0e4d9c8d2256819a407e6c1d82c4972c00

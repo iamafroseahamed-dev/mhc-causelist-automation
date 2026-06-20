@@ -1,3 +1,5 @@
+import os
+import time
 import datetime
 import requests
 import urllib3
@@ -9,17 +11,47 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SUPABASE_URL = "https://iyohifpzsqjxcrgrtsza.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5b2hpZnB6c3FqeGNyZ3J0c3phIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTU4OTQ1MiwiZXhwIjoyMDk3MTY1NDUyfQ.BLz5-PeIc5TTjSAiYuWxnGgJYrVnqjh0RYwdirJn_50"
 
-
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
+
+def download_xml(url, headers):
+    last_error = None
+
+    for attempt in range(1, 6):
+        try:
+            print(f"Download attempt {attempt}/5: {url}")
+
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=(30, 180),
+                verify=False
+            )
+
+            response.raise_for_status()
+            return response.content
+
+        except requests.exceptions.RequestException as error:
+            last_error = error
+            print(f"Attempt {attempt} failed: {error}")
+
+            if attempt < 5:
+                time.sleep(20)
+
+    raise last_error
+
+
+def chunk_list(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 today = datetime.date.today()
-# For testing:
-# today = datetime.date(2026, 6, 13)
 
 file_date = today.strftime("%d%m%Y")
 db_date = today.strftime("%Y-%m-%d")
 
-url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_22062026.xml"
+url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
 
 headers = {
     "User-Agent": "Mozilla/5.0",
@@ -27,21 +59,10 @@ headers = {
     "Referer": "https://mhc.tn.gov.in/judis/clists/clists-madras/index.php"
 }
 
-print("Clearing daily_cause_list table...")
-
-supabase.table("daily_cause_list") \
-    .delete() \
-    .neq("id", "00000000-0000-0000-0000-000000000000") \
-    .execute()
-
-print("Table cleared.")
-
 print("Downloading XML:", url)
 
-res = requests.get(url, headers=headers, timeout=60, verify=False)
-res.raise_for_status()
-
-root = ET.fromstring(res.content)
+xml_content = download_xml(url, headers)
+root = ET.fromstring(xml_content)
 
 rows = []
 
@@ -76,7 +97,7 @@ for court in root.findall(".//court"):
                 "cnr_number": None,
                 "petitioner": petitioner,
                 "respondent": respondent,
-                "party_names": f"{petitioner} vs {respondent}",
+                "party_names": f"{petitioner or ''} vs {respondent or ''}",
                 "judge_name": judge_name,
                 "section": case_type,
                 "district": None,
@@ -114,11 +135,21 @@ deduped_rows = list(seen.values())
 print("Parsed rows:", len(rows))
 print("Deduplicated rows:", len(deduped_rows))
 
+print("Clearing today's daily_cause_list records...")
+
+supabase.table("daily_cause_list") \
+    .delete() \
+    .eq("cause_date", db_date) \
+    .execute()
+
+print("Today's records cleared.")
+
 if deduped_rows:
-    supabase.table("daily_cause_list").upsert(
-        deduped_rows,
-        on_conflict="cause_date,court_hall,item_number,case_number"
-    ).execute()
+    for batch in chunk_list(deduped_rows, 500):
+        supabase.table("daily_cause_list").upsert(
+            batch,
+            on_conflict="cause_date,court_hall,item_number,case_number"
+        ).execute()
 
 print("XML URL:", url)
 print("Inserted/Updated:", len(deduped_rows))

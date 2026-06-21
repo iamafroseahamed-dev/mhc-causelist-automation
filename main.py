@@ -443,10 +443,6 @@ def _derive_case_patch(match: Dict, today_str: str) -> Optional[Dict]:
     listed = match.get('listed_date') or today_str
     patch['last_listed_date'] = listed
 
-    stage = (match.get('stage') or '').strip()
-    if stage:
-        patch['current_stage'] = stage
-
     # eCourts enrichment fields — only applied when sync succeeded
     if match.get('ecourts_sync_status') == 'done':
         patch['ecourts_last_synced_at'] = now_iso

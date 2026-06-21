@@ -650,7 +650,7 @@ def run_matching_pipeline(listed_date: str) -> None:
         log(f'Pipeline error: {exc}', 'match')
 
 
-today = datetime.date.today()
+today = datetime.datetime.now(IST).date()
 # For testing:
 # today = datetime.date(2026, 6, 13)
 
@@ -742,6 +742,8 @@ except ET.ParseError as error:
 
 rows = []
 
+rows = []
+
 for court in root.findall(".//court"):
     court_hall = court.findtext("courtno")
     judge_name = court.findtext("judge1")
@@ -751,7 +753,7 @@ for court in root.findall(".//court"):
 
         for case in stage.findall(".//casedetails"):
             case_type = case.findtext("mcasetype")
-            case_no = case.findtext("mcaseno")
+            case_no   = case.findtext("mcaseno")
             case_year = case.findtext("mcaseyr")
 
             case_number = None
@@ -760,38 +762,106 @@ for court in root.findall(".//court"):
 
             petitioner = case.findtext("pname")
             respondent = case.findtext("rname")
+            serial_no  = case.findtext("serial_no")
+
+            # ── Build the raw_data dict for the main case ──────────────────
+            raw_data = {
+                "mcasetype":    case_type,
+                "mcaseno":      case_no,
+                "mcaseyr":      case_year,
+                "mpadv":        case.findtext("mpadv"),
+                "mradv":        case.findtext("mradv"),
+                "case_remarks": case.findtext("case_remarks"),
+            }
+
+            # ── Collect <extra> linked cases ───────────────────────────────
+            extras = []
+            for extra in case.findall("extra"):
+                ex_type = extra.findtext("excasetype")
+                ex_no   = extra.findtext("excaseno")
+                ex_year = extra.findtext("excaseyr")
+                ex_case_number = None
+                if ex_type and ex_no and ex_year:
+                    ex_case_number = f"{ex_type}/{ex_no}/{ex_year}"
+                extras.append({
+                    "case_number":    ex_case_number,
+                    "excasetype":     ex_type,
+                    "excaseno":       ex_no,
+                    "excaseyr":       ex_year,
+                    "petitioner":     extra.findtext("expname"),
+                    "respondent":     extra.findtext("exrname"),
+                    "petitioner_adv": extra.findtext("expadv"),
+                    "respondent_adv": extra.findtext("exradv"),
+                    "case_remarks":   extra.findtext("excaseremarks"),
+                })
+
+            if extras:
+                raw_data["extra_cases"] = extras
 
             rows.append({
-                "cause_date": db_date,
-                "source_type": "xml",
-                "source_url": url,
-                "court_name": "Madras High Court",
-                "bench": "Chennai",
-                "court_hall": court_hall,
-                "item_number": case.findtext("serial_no"),
-                "case_number": case_number,
-                "cnr_number": None,
-                "petitioner": petitioner,
-                "respondent": respondent,
-                "party_names": f"{petitioner or ''} vs {respondent or ''}",
-                "judge_name": judge_name,
-                "section": case_type,
-                "district": None,
-                "prayer": None,
+                "cause_date":           db_date,
+                "source_type":          "xml",
+                "source_url":           url,
+                "court_name":           "Madras High Court",
+                "bench":                "Chennai",
+                "court_hall":           court_hall,
+                "item_number":          serial_no,
+                "case_number":          case_number,
+                "cnr_number":           None,
+                "petitioner":           petitioner,
+                "respondent":           respondent,
+                "party_names":          f"{petitioner or ''} vs {respondent or ''}",
+                "judge_name":           judge_name,
+                "section":              case_type,
+                "district":             None,
+                "prayer":               None,
                 "last_hearing_or_stage": stage_name,
-                "counsel_name": case.findtext("mpadv"),
-                "raw_text": ET.tostring(case, encoding="unicode"),
-                "raw_data": {
-                    "mcasetype": case_type,
-                    "mcaseno": case_no,
-                    "mcaseyr": case_year,
-                    "mpadv": case.findtext("mpadv"),
-                    "mradv": case.findtext("mradv"),
-                    "case_remarks": case.findtext("case_remarks"),
-                },
-                "import_status": "imported",
-                "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "counsel_name":         case.findtext("mpadv"),
+                "raw_text":             ET.tostring(case, encoding="unicode"),
+                "raw_data":             raw_data,
+                "import_status":        "imported",
+                "updated_at":           datetime.datetime.now(datetime.UTC).isoformat(),
             })
+
+            # ── Also insert each <extra> as its own row ────────────────────
+            for idx, ex in enumerate(extras, start=1):
+                if not ex["case_number"]:
+                    continue   # skip malformed extras with no case number
+
+                rows.append({
+                    "cause_date":           db_date,
+                    "source_type":          "xml",
+                    "source_url":           url,
+                    "court_name":           "Madras High Court",
+                    "bench":                "Chennai",
+                    "court_hall":           court_hall,
+                    # extras share the parent's serial_no; suffix keeps them unique
+                    "item_number":          f"{serial_no}-E{idx}" if serial_no else None,
+                    "case_number":          ex["case_number"],
+                    "cnr_number":           None,
+                    "petitioner":           ex["petitioner"],
+                    "respondent":           ex["respondent"],
+                    "party_names":          f"{ex['petitioner'] or ''} vs {ex['respondent'] or ''}",
+                    "judge_name":           judge_name,
+                    "section":              ex["excasetype"],
+                    "district":             None,
+                    "prayer":               ex.get("case_remarks") or None,
+                    "last_hearing_or_stage": stage_name,
+                    "counsel_name":         ex.get("petitioner_adv"),
+                    "raw_text":             ET.tostring(case, encoding="unicode"),
+                    "raw_data":             {
+                        "excasetype":     ex["excasetype"],
+                        "excaseno":       ex["excaseno"],
+                        "excaseyr":       ex["excaseyr"],
+                        "expadv":         ex.get("petitioner_adv"),
+                        "exradv":         ex.get("respondent_adv"),
+                        "case_remarks":   ex.get("case_remarks"),
+                        "parent_case":    case_number,
+                        "is_extra":       True,
+                    },
+                    "import_status":        "imported",
+                    "updated_at":           datetime.datetime.now(datetime.UTC).isoformat(),
+                })
 
 seen = {}
 

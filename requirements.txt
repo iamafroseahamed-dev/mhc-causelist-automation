@@ -4,3 +4,4 @@
 requests>=2.32.0
 supabase>=2.10.0
 urllib3>=2.2.0
+beautifulsoup4>=4.12.0

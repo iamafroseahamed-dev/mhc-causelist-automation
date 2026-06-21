@@ -742,7 +742,6 @@ except ET.ParseError as error:
 
 rows = []
 
-rows = []
 
 for court in root.findall(".//court"):
     court_hall = court.findtext("courtno")

@@ -121,6 +121,28 @@ def _fetch_active_cases() -> List[Dict]:
     return []
 
 
+def _fetch_all_cases_for_existence() -> List[Dict]:
+    select_candidates = [
+        'id,organization_id,case_number,cnr_number,active',
+        'id,organization_id,case_number,cnr_number',
+        'id,case_number,cnr_number,active',
+        'id,case_number,cnr_number',
+    ]
+
+    last_error = None
+    for select_expr in select_candidates:
+        try:
+            params = {'select': select_expr}
+            return _fetch_all('cases', params)
+        except Exception as exc:
+            last_error = exc
+            log(f'Cases existence fetch fallback for select={select_expr!r}: {exc}', 'match')
+
+    if last_error:
+        raise last_error
+    return []
+
+
 # ── Case-number normalisation ──────────────────────────────────────────────────
 
 def normalize_case_number(s: Optional[str]) -> str:
@@ -154,6 +176,115 @@ def normalize_case_number(s: Optional[str]) -> str:
         if ct and cn and re.match(r'^\d{2,4}$', cy):
             return f'{ct}/{cn}/{cy}'
     return re.sub(r'[^A-Z0-9]', '', s)
+
+
+def _is_for_admission(stage: Optional[str]) -> bool:
+    normal = re.sub(r'\s+', ' ', (stage or '').strip().upper())
+    return normal == 'FOR ADMISSION'
+
+
+def _build_case_index(cases: List[Dict]) -> Dict[str, Dict]:
+    indexed: Dict[str, Dict] = {}
+    for c in cases:
+        norm_case = normalize_case_number(c.get('case_number') or '')
+        if not norm_case:
+            continue
+        if norm_case not in indexed:
+            indexed[norm_case] = c
+            continue
+        # Prefer active entries when multiple rows share a normalized case number.
+        existing_active = bool(indexed[norm_case].get('active'))
+        incoming_active = bool(c.get('active'))
+        if incoming_active and not existing_active:
+            indexed[norm_case] = c
+    return indexed
+
+
+def _safe_create_case(case_number: str) -> Optional[Dict]:
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    payload_variants = [
+        {
+            'case_number': case_number,
+            'active': True,
+            'created_at': now_iso,
+            'updated_at': now_iso,
+        },
+        {
+            'case_number': case_number,
+            'active': True,
+            'updated_at': now_iso,
+        },
+        {
+            'case_number': case_number,
+            'updated_at': now_iso,
+        },
+        {
+            'case_number': case_number,
+        },
+    ]
+
+    for payload in payload_variants:
+        try:
+            resp = requests.post(
+                f'{SUPABASE_URL}/rest/v1/cases',
+                headers={**_sb_headers('return=representation'), 'Prefer': 'return=representation'},
+                json=[payload],
+                timeout=20,
+            )
+
+            if resp.ok:
+                created_rows = resp.json() if resp.text.strip() else []
+                if isinstance(created_rows, list) and created_rows:
+                    return created_rows[0]
+                return payload
+
+            ct = resp.headers.get('content-type', '')
+            err = resp.json() if 'json' in ct else {'message': resp.text[:200]}
+            if isinstance(err, dict):
+                code = err.get('code', '')
+                msg = err.get('message', '')
+            else:
+                code = ''
+                msg = str(err)
+
+            # Retry with the next, smaller payload if a column is missing.
+            if code in ('PGRST204', '42703'):
+                continue
+
+            # If duplicate key already exists, stop creating; caller should re-check index.
+            if code == '23505':
+                return None
+
+            log(f'Create case failed for {case_number!r}: {err}', 'match')
+            return None
+
+        except Exception as exc:
+            log(f'Create case exception for {case_number!r}: {exc}', 'match')
+            return None
+
+    return None
+
+
+def _ensure_case_exists_for_admission(
+    case_number: str,
+    case_index_by_norm: Dict[str, Dict],
+) -> Optional[Dict]:
+    norm_case = normalize_case_number(case_number)
+    if not norm_case:
+        return None
+
+    existing = case_index_by_norm.get(norm_case)
+    if existing:
+        return existing
+
+    created = _safe_create_case(case_number)
+    if not created:
+        return None
+
+    created.setdefault('case_number', case_number)
+    created.setdefault('active', True)
+    case_index_by_norm[norm_case] = created
+    return created
 
 
 # ── Date parsing ───────────────────────────────────────────────────────────────
@@ -628,12 +759,12 @@ def run_matching_pipeline(listed_date: str) -> None:
         cases = _fetch_active_cases()
         log(f'Active tracked cases: {len(cases)}', 'match')
 
+        all_cases = _fetch_all_cases_for_existence()
+        log(f'Total cases for existence check: {len(all_cases)}', 'match')
+
         log_section('STEP 3 — Build active-case lookup')
-        case_by_norm: Dict[str, Dict] = {}
-        for c in cases:
-            norm_case = normalize_case_number(c.get('case_number') or '')
-            if norm_case and norm_case not in case_by_norm:
-                case_by_norm[norm_case] = c
+        case_by_norm = _build_case_index(cases)
+        case_exists_by_norm = _build_case_index(all_cases)
 
         log_section('STEP 4 — Match by case number or CLA text')
         base_matches: List[Dict] = []
@@ -644,6 +775,20 @@ def run_matching_pipeline(listed_date: str) -> None:
 
             if not matched_case and not land_admin_match:
                 continue
+
+            stage_status = cl.get('stage_status')
+            if not matched_case and _is_for_admission(stage_status):
+                ensured = _ensure_case_exists_for_admission(
+                    cl.get('case_number') or '',
+                    case_exists_by_norm,
+                )
+                if ensured:
+                    matched_case = ensured
+                    if norm_cl_case:
+                        case_by_norm[norm_cl_case] = ensured
+                    log(f'FOR ADMISSION ensured case exists for {cl.get("case_number")!r}', 'match')
+                else:
+                    log(f'FOR ADMISSION case create skipped/failed for {cl.get("case_number")!r}', 'match')
 
             match_type = 'case_number' if matched_case else 'land_admin'
             case_number_value = matched_case.get('case_number') if matched_case else cl.get('case_number')

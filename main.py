@@ -43,15 +43,21 @@ IST              = _IST_TZ
 PAGE_SIZE        = 1000
 BATCH_SIZE       = 500
 ECOURTS_HIST_URL = 'https://hcservices.ecourts.gov.in/hcservices/cases_qry/o_civil_case_history.php'
+ECOURTS_HOME_URL = 'https://hcservices.ecourts.gov.in/'
 ECOURTS_TIMEOUT  = (5, 20)
 ECOURTS_WORKERS  = 5
 ECOURTS_BUDGET_S = 45
+ECOURTS_RETRIES  = 3
+CLA_PATTERNS     = (
+    'the commissioner of land administration',
+    'land administration department',
+)
 BASE_MATCH_COLS  = frozenset({
-    'listed_date', 'match_date', 'organization_id',
+    'listed_date',
     'case_id', 'daily_cause_list_id',
-    'case_number', 'cnr_number', 'court_hall', 'item_number',
+    'case_number', 'court_hall', 'item_number',
     'judge_name', 'stage', 'petitioner', 'respondent',
-    'match_type', 'match_status', 'notification_status', 'cnr_status',
+    'notification_status', 'created_at', 'updated_at',
 })
 _MONTHS = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
@@ -89,6 +95,30 @@ def _fetch_all(table: str, params: Dict) -> List[Dict]:
             break
         offset += PAGE_SIZE
     return rows
+
+
+def _fetch_active_cases() -> List[Dict]:
+    select_candidates = [
+        'id,organization_id,case_number,cnr_number,active',
+        'id,organization_id,case_number,cnr_number',
+    ]
+
+    last_error = None
+    for select_expr in select_candidates:
+        try:
+            params = {'select': select_expr, 'active': 'eq.true'}
+            cases = _fetch_all('cases', params)
+            for c in cases:
+                c.setdefault('ecourts_case_no', None)
+                c.setdefault('active', True)
+            return cases
+        except Exception as exc:
+            last_error = exc
+            log(f'Cases fetch fallback for select={select_expr!r}: {exc}', 'match')
+
+    if last_error:
+        raise last_error
+    return []
 
 
 # ── Case-number normalisation ──────────────────────────────────────────────────
@@ -278,38 +308,96 @@ def _parse_ecourts_html(html: str) -> Optional[Dict[str, Any]]:
 
 # ── Per-match eCourts enrichment ───────────────────────────────────────────────
 
+def _to_text(value: Any) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _raw_data_dict(cl_row: Dict) -> Dict[str, Any]:
+    raw_data = cl_row.get('raw_data')
+    if isinstance(raw_data, dict):
+        return raw_data
+    if isinstance(raw_data, str):
+        try:
+            parsed = json.loads(raw_data)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _is_extra_case_row(cl_row: Dict) -> bool:
+    raw = _raw_data_dict(cl_row)
+    return bool(raw.get('is_extra'))
+
+
+def _build_party_search_text(cl_row: Dict) -> str:
+    parts = [
+        _to_text(cl_row.get('case_number')),
+        _to_text(cl_row.get('petitioner')),
+        _to_text(cl_row.get('respondent')),
+        _to_text(cl_row.get('prayer')),
+        _to_text(cl_row.get('stage_status')),
+    ]
+
+    return ' '.join(parts).lower()
+
+
+def _is_land_admin_match(cl_row: Dict) -> bool:
+    text = _build_party_search_text(cl_row)
+    return any(pattern in text for pattern in CLA_PATTERNS)
+
+
+def _run_hearing_history_post(ecourts_case_no: str, cnr_number: str) -> requests.Response:
+    return requests.post(
+        ECOURTS_HIST_URL,
+        data={
+            'court_code': '1',
+            'state_code': '10',
+            'court_complex_code': '1',
+            'case_no': ecourts_case_no,
+            'cino': cnr_number,
+            'appFlag': '',
+        },
+        headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': ECOURTS_HOME_URL,
+            'X-Requested-With': 'XMLHttpRequest',
+        },
+        timeout=ECOURTS_TIMEOUT,
+        verify=False,
+    )
+
+
 def _enrich_match(match: Dict) -> Dict:
-    cnr     = (match.get('cnr_number') or '').strip()
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+    cnr = (match.get('cnr_number') or '').strip()
+    ecourts_case_no = (match.get('ecourts_case_no') or '').strip()
+
     if not cnr:
-        match['ecourts_sync_status'] = 'pending_cnr'
-        match['ecourts_synced_at']   = now_iso
+        match['ecourts_sync_status'] = 'pending_cnr_discovery'
+        match['ecourts_synced_at'] = now_iso
         return match
 
     try:
-        resp = requests.get(
-            ECOURTS_HIST_URL,
-            params={
-                'state_code':           '10',
-                'dist_code':            '1',
-                'court_code':           '1',
-                'caseStatusSearchType': 'CNRNumber',
-                'cino':                 cnr,
-                'national_court_code':  'HCMA01',
-            },
-            headers={
-                'User-Agent':       'Mozilla/5.0',
-                'Referer':          'https://hcservices.ecourts.gov.in/',
-                'X-Requested-With': 'XMLHttpRequest',
-            },
-            timeout=ECOURTS_TIMEOUT,
-            verify=False,
-        )
-        if not resp.ok:
+        resp = None
+        for _ in range(ECOURTS_RETRIES):
+            resp = _run_hearing_history_post(ecourts_case_no, cnr)
+            if resp.ok:
+                break
+
+        if resp is None or not resp.ok:
             match['ecourts_sync_status'] = 'failed'
-            match['ecourts_error']       = f'HTTP {resp.status_code}'
-            match['ecourts_synced_at']   = now_iso
+            match['ecourts_error'] = f'HTTP {resp.status_code}' if resp is not None else 'No response'
+            match['ecourts_synced_at'] = now_iso
             return match
 
         parsed = _parse_ecourts_html(resp.text)
@@ -327,57 +415,32 @@ def _enrich_match(match: Dict) -> Dict:
 
     except Exception as exc:
         match['ecourts_sync_status'] = 'failed'
-        match['ecourts_error']       = str(exc)[:200]
-        match['ecourts_synced_at']   = now_iso
+        match['ecourts_error'] = str(exc)[:200]
+        match['ecourts_synced_at'] = now_iso
         return match
 
 
-def _enrich_all(matches: List[Dict]) -> Tuple[List[Dict], int]:
+def _enrich_all(
+    matches: List[Dict],
+) -> Tuple[List[Dict], int]:
     if not matches:
         return [], 0
 
-    no_cnr   = [m for m in matches if not (m.get('cnr_number') or '').strip()]
-    to_fetch = [m for m in matches if (m.get('cnr_number') or '').strip()]
-
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    for m in no_cnr:
-        m['ecourts_sync_status'] = 'pending_cnr'
-        m['ecourts_synced_at']   = now_iso
-
-    if not to_fetch:
-        return no_cnr, 0
-
-    enriched: List[Dict] = list(no_cnr)
+    enriched: List[Dict] = []
     done_count = 0
-    deadline   = time.monotonic() + ECOURTS_BUDGET_S
+    deadline = time.monotonic() + ECOURTS_BUDGET_S
 
-    executor = ThreadPoolExecutor(max_workers=ECOURTS_WORKERS)
-    pending: Dict[Any, Dict] = {executor.submit(_enrich_match, m): m for m in to_fetch}
-
-    try:
-        while pending and time.monotonic() < deadline:
-            remaining = max(0.1, deadline - time.monotonic())
-            done_set, _ = wait(list(pending.keys()), timeout=remaining,
-                               return_when=FIRST_COMPLETED)
-            for f in done_set:
-                m = pending.pop(f)
-                try:
-                    result = f.result()
-                    enriched.append(result)
-                    if result.get('ecourts_sync_status') == 'done':
-                        done_count += 1
-                except Exception as exc:
-                    m['ecourts_sync_status'] = 'failed'
-                    m['ecourts_error']       = str(exc)[:200]
-                    m['ecourts_synced_at']   = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    enriched.append(m)
-
-        for f, m in list(pending.items()):
-            f.cancel()
-            m['ecourts_sync_status'] = 'pending'
+    for m in matches:
+        if time.monotonic() >= deadline:
+            m['ecourts_sync_status'] = 'pending_budget'
+            m['ecourts_synced_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             enriched.append(m)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+            continue
+
+        result = _enrich_match(m)
+        enriched.append(result)
+        if result.get('ecourts_sync_status') == 'done':
+            done_count += 1
 
     return enriched, done_count
 
@@ -402,34 +465,70 @@ def _safe_upsert_batch(batch: List[Dict]) -> int:
             params=params, json=_normalise_keys(rows), timeout=30,
         )
 
-    r = _post(batch, upsert=True)
-    if r.ok:
-        return len(batch)
+    # Keep only columns supported by today_matched_listings schema.
+    working_batch = [{k: v for k, v in row.items() if k in BASE_MATCH_COLS} for row in batch]
+    for _ in range(20):
+        r = _post(working_batch, upsert=True)
+        if r.ok:
+            return len(working_batch)
 
-    ct  = r.headers.get('content-type', '')
-    err = r.json() if 'json' in ct else {}
-    if not isinstance(err, dict):
-        err = {}
-    code = err.get('code', '')
-    msg  = err.get('message', '')
+        ct  = r.headers.get('content-type', '')
+        err = r.json() if 'json' in ct else {}
+        if not isinstance(err, dict):
+            err = {}
+        code = err.get('code', '')
+        msg  = err.get('message', '')
 
-    if code == '42703':
-        log('WARNING: missing columns; falling back to base-only insert.', 'match')
-        base_batch = [{k: v for k, v in row.items() if k in BASE_MATCH_COLS} for row in batch]
-        r2 = _post(base_batch, upsert=True)
-        return len(base_batch) if r2.ok else 0
+        missing = None
+        if code == 'PGRST204':
+            m = re.search(r"find the '(\w+)' column", msg)
+            if m:
+                missing = m.group(1)
+        elif code == '42703':
+            m = re.search(r"column [\"']?(\w+)[\"']? does not exist", msg)
+            if m:
+                missing = m.group(1)
 
-    if code == 'PGRST204':
-        m2 = re.search(r"find the '(\w+)' column", msg)
-        if m2:
-            missing = m2.group(1)
+        if missing:
             log(f'Column {missing!r} missing - stripping and retrying.', 'match')
-            stripped = [{k: v for k, v in row.items() if k != missing} for row in batch]
-            r2 = _post(stripped, upsert=(missing != 'listed_date'))
-            if r2.ok:
-                return len(stripped)
+            working_batch = [{k: v for k, v in row.items() if k != missing} for row in working_batch]
+            continue
 
-    log(f'Upsert error {r.status_code}: {err or r.text[:200]}', 'match')
+        log(f'Upsert error {r.status_code}: {err or r.text[:200]}', 'match')
+        return 0
+
+    log('Upsert failed after repeated missing-column retries.', 'match')
+    return 0
+
+
+def _safe_upsert_daily_cause_batch(batch: List[Dict]) -> int:
+    def _normalise_keys(rows: List[Dict]) -> List[Dict]:
+        all_keys: set = set()
+        for r in rows:
+            all_keys.update(r.keys())
+        return [{k: r.get(k) for k in all_keys} for r in rows]
+
+    working_batch = list(batch)
+    for _ in range(20):
+        try:
+            supabase.table("daily_cause_list").upsert(
+                _normalise_keys(working_batch),
+                on_conflict="cause_date,court_hall,item_number,case_number"
+            ).execute()
+            return len(working_batch)
+        except Exception as exc:
+            msg = str(exc)
+            m = re.search(r"find the '(\w+)' column", msg)
+            if not m:
+                m = re.search(r"column [\"']?(\w+)[\"']?", msg)
+            if m:
+                missing = m.group(1)
+                log(f"daily_cause_list missing column {missing!r} - stripping and retrying.", 'db')
+                working_batch = [{k: v for k, v in row.items() if k != missing} for row in working_batch]
+                continue
+            raise
+
+    log('daily_cause_list upsert failed after repeated missing-column retries.', 'db')
     return 0
 
 
@@ -443,35 +542,13 @@ def _derive_case_patch(match: Dict, today_str: str) -> Optional[Dict]:
     listed = match.get('listed_date') or today_str
     patch['last_listed_date'] = listed
 
-    # eCourts enrichment fields — only applied when sync succeeded
-    if match.get('ecourts_sync_status') == 'done':
-        patch['ecourts_last_synced_at'] = now_iso
+    # Sync the latest cause-list stage to cases status fields.
+    stage_status = (match.get('stage') or '').strip()
+    if stage_status:
+        patch['case_status'] = stage_status
+        patch['last_hearing_update'] = stage_status
 
-        raw_status = (match.get('latest_case_status') or '').strip()
-        if raw_status:
-            sl = raw_status.lower()
-            if 'dispos' in sl:
-                patch['case_status'] = 'Disposed'
-                patch['active']      = False
-            elif 'pending' in sl:
-                patch['case_status'] = 'Pending'
-            else:
-                patch['case_status'] = raw_status
-
-        if match.get('latest_hearing_date'):
-            patch['last_hearing_date'] = match['latest_hearing_date']
-
-        lhr = (match.get('latest_hearing_remarks') or '').strip()
-        if lhr:
-            patch['last_hearing_update'] = lhr
-
-        nhd = match.get('next_hearing_date')
-        if nhd:
-            patch['next_hearing_date'] = nhd
-            if nhd >= today_str:
-                patch['follow_up_status'] = 'Active'
-
-    substantive = set(patch) - {'updated_at', 'ecourts_last_synced_at'}
+    substantive = set(patch) - {'updated_at'}
     return patch if substantive else None
 
 
@@ -530,14 +607,15 @@ def _sync_cases_table(enriched_matches: List[Dict]) -> int:
 # ── Main matching + enrichment + notification pipeline ─────────────────────────
 
 def run_matching_pipeline(listed_date: str) -> None:
-    """Match daily_cause_list against tracked cases, enrich with eCourts, and notify."""
+    """Match cause list rows by case-number or CLA party text and enrich from eCourts."""
     t0 = time.monotonic()
     try:
-        # 1. Cause list rows for this date
         log_section('STEP 1 — Fetch daily cause list')
         cause_list = _fetch_all('daily_cause_list', {
-            'select': ('id,case_number,cnr_number,court_hall,item_number,'
-                       'judge_name,last_hearing_or_stage,petitioner,respondent'),
+            'select': (
+                'id,case_number,court_hall,item_number,judge_name,'
+                'stage_status,petitioner,respondent,prayer'
+            ),
             'cause_date': f'eq.{listed_date}',
             'order':      'court_hall.asc,item_number.asc',
         })
@@ -546,75 +624,54 @@ def run_matching_pipeline(listed_date: str) -> None:
             return
         log(f'Cause list rows: {len(cause_list)}', 'match')
 
-        # 2. All active tracked cases
         log_section('STEP 2 — Fetch tracked cases')
-        cases = _fetch_all('cases', {
-            'select': 'id,organization_id,case_number,cnr_number',
-            'active': 'eq.true',
-        })
+        cases = _fetch_active_cases()
         log(f'Active tracked cases: {len(cases)}', 'match')
-        if not cases:
-            log('No active cases to match against. Skipping.', 'match')
-            return
 
-        # 3. Build lookup maps
-        cl_by_cnr:  Dict[str, Dict] = {}
-        cl_by_norm: Dict[str, Dict] = {}
-        for cl in cause_list:
-            raw_cnr = (cl.get('cnr_number') or '').strip()
-            if raw_cnr:
-                cl_by_cnr[raw_cnr.lower()] = cl
-            norm_cn = normalize_case_number(cl.get('case_number') or '')
-            if norm_cn:
-                cl_by_norm[norm_cn] = cl
-
-        # 4. Match each case
-        log_section('STEP 3 — Match cause list against cases')
-        base_matches: List[Dict] = []
-        seen: set = set()
+        log_section('STEP 3 — Build active-case lookup')
+        case_by_norm: Dict[str, Dict] = {}
         for c in cases:
-            matched_cl: Optional[Dict] = None
-            match_type = 'case_number'
-            case_cnr = (c.get('cnr_number') or '').strip()
+            norm_case = normalize_case_number(c.get('case_number') or '')
+            if norm_case and norm_case not in case_by_norm:
+                case_by_norm[norm_case] = c
 
-            if case_cnr and case_cnr.lower() in cl_by_cnr:
-                matched_cl = cl_by_cnr[case_cnr.lower()]
-                match_type = 'cnr'
+        log_section('STEP 4 — Match by case number or CLA text')
+        base_matches: List[Dict] = []
+        for cl in cause_list:
+            norm_cl_case = normalize_case_number(cl.get('case_number') or '')
+            matched_case = case_by_norm.get(norm_cl_case) if norm_cl_case else None
+            land_admin_match = _is_land_admin_match(cl)
 
-            if not matched_cl:
-                norm_c = normalize_case_number(c.get('case_number') or '')
-                if norm_c and norm_c in cl_by_norm:
-                    matched_cl = cl_by_norm[norm_c]
-
-            if not matched_cl:
+            if not matched_case and not land_admin_match:
                 continue
 
-            pair = (c['id'], matched_cl['id'])
-            if pair in seen:
-                continue
-            seen.add(pair)
+            match_type = 'case_number' if matched_case else 'land_admin'
+            case_number_value = matched_case.get('case_number') if matched_case else cl.get('case_number')
+            case_cnr = (matched_case.get('cnr_number') or '').strip() if matched_case else ''
 
-            log(f'MATCH ({match_type})  CL={matched_cl.get("case_number")!r}  CASE={c.get("case_number")!r}  CNR={case_cnr!r}', 'match')
+            if _is_extra_case_row(cl):
+                log(f'MATCHED EXTRA CASE: {cl.get("case_number") or case_number_value}', 'match')
+            else:
+                log(f'MATCHED PARENT CASE: {cl.get("case_number") or case_number_value}', 'match')
 
-            item_raw = matched_cl.get('item_number')
+            log(f'MATCH ({match_type})  CL={cl.get("case_number")!r} CASE={case_number_value!r} CNR={case_cnr!r}', 'match')
+
+            item_raw = cl.get('item_number')
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             base_matches.append({
                 'listed_date':         listed_date,
-                'match_date':          listed_date,
-                'organization_id':     c.get('organization_id'),
-                'case_id':             c['id'],
-                'daily_cause_list_id': matched_cl['id'],
-                'case_number':         matched_cl.get('case_number'),
-                'cnr_number':          case_cnr or None,
-                'court_hall':          matched_cl.get('court_hall'),
+                'case_id':             matched_case.get('id') if matched_case else None,
+                'daily_cause_list_id': cl['id'],
+                'case_number':         case_number_value,
+                'court_hall':          cl.get('court_hall'),
                 'item_number':         str(item_raw).strip() if item_raw is not None else None,
-                'judge_name':          matched_cl.get('judge_name'),
-                'stage':               matched_cl.get('last_hearing_or_stage'),
-                'petitioner':          matched_cl.get('petitioner'),
-                'respondent':          matched_cl.get('respondent'),
-                'match_type':          match_type,
-                'match_status':        'matched',
-                'cnr_status':          'discovered' if case_cnr else 'not_discovered',
-                'ecourts_sync_status': 'pending',
+                'judge_name':          cl.get('judge_name'),
+                'stage':               cl.get('stage_status'),
+                'petitioner':          cl.get('petitioner'),
+                'respondent':          cl.get('respondent'),
+                'notification_status': 'not_notified',
+                'created_at':          now_iso,
+                'updated_at':          now_iso,
             })
 
         log(f'Total matches found: {len(base_matches)}', 'match')
@@ -622,29 +679,21 @@ def run_matching_pipeline(listed_date: str) -> None:
             log('No matches. Pipeline done.', 'match')
             return
 
-        # 5. Enrich with eCourts hearing history
-        log_section('STEP 4 — eCourts enrichment')
-        log(f'Enriching {len(base_matches)} match(es) via eCourts (budget={ECOURTS_BUDGET_S}s)...', 'match')
-        enriched_matches, enriched_count = _enrich_all(base_matches)
-        log(f'eCourts enriched: {enriched_count}/{len(base_matches)}', 'match')
-
-        # 6. Upsert to today_matched_listings
-        log_section('STEP 5 — Upsert to today_matched_listings')
+        log_section('STEP 5 — Upsert listing rows')
         inserted = 0
-        for i in range(0, len(enriched_matches), BATCH_SIZE):
-            inserted += _safe_upsert_batch(enriched_matches[i:i + BATCH_SIZE])
-        log(f'Upserted to today_matched_listings: {inserted}', 'match')
+        for i in range(0, len(base_matches), BATCH_SIZE):
+            inserted += _safe_upsert_batch(base_matches[i:i + BATCH_SIZE])
+        log(f'Upserted base rows into today_matched_listings: {inserted}', 'match')
 
-        # 6b. Sync cases master table with latest court status + cause list stage
         log_section('STEP 6 — Sync cases master table')
         try:
-            synced = _sync_cases_table(enriched_matches)
-            log(f'Cases master table updated: {synced}/{len(enriched_matches)}', 'sync')
+            synced = _sync_cases_table(base_matches)
+            log(f'Cases master table updated: {synced}/{len(base_matches)}', 'sync')
         except Exception as exc:
             log(f'Error (non-fatal): {exc}', 'sync')
 
         elapsed_total = time.monotonic() - t0
-        log_section(f'PIPELINE COMPLETE  matched={inserted}  enriched={enriched_count}  elapsed={elapsed_total:.1f}s')
+        log_section(f'PIPELINE COMPLETE  matched={inserted}  elapsed={elapsed_total:.1f}s')
 
     except Exception as exc:
         log(f'Pipeline error: {exc}', 'match')
@@ -799,26 +848,16 @@ for court in root.findall(".//court"):
 
             rows.append({
                 "cause_date":           db_date,
-                "source_type":          "xml",
-                "source_url":           url,
                 "court_name":           "Madras High Court",
                 "bench":                "Chennai",
                 "court_hall":           court_hall,
                 "item_number":          serial_no,
                 "case_number":          case_number,
-                "cnr_number":           None,
                 "petitioner":           petitioner,
                 "respondent":           respondent,
-                "party_names":          f"{petitioner or ''} vs {respondent or ''}",
                 "judge_name":           judge_name,
-                "section":              case_type,
-                "district":             None,
-                "prayer":               None,
-                "last_hearing_or_stage": stage_name,
-                "counsel_name":         case.findtext("mpadv"),
-                "raw_text":             ET.tostring(case, encoding="unicode"),
-                "raw_data":             raw_data,
-                "import_status":        "imported",
+                "prayer":               raw_data.get("case_remarks") or None,
+                "stage_status":         stage_name,
                 "updated_at":           datetime.datetime.now(datetime.UTC).isoformat(),
             })
 
@@ -829,36 +868,17 @@ for court in root.findall(".//court"):
 
                 rows.append({
                     "cause_date":           db_date,
-                    "source_type":          "xml",
-                    "source_url":           url,
                     "court_name":           "Madras High Court",
                     "bench":                "Chennai",
                     "court_hall":           court_hall,
                     # extras share the parent's serial_no; suffix keeps them unique
                     "item_number":          f"{serial_no}-E{idx}" if serial_no else None,
                     "case_number":          ex["case_number"],
-                    "cnr_number":           None,
                     "petitioner":           ex["petitioner"],
                     "respondent":           ex["respondent"],
-                    "party_names":          f"{ex['petitioner'] or ''} vs {ex['respondent'] or ''}",
                     "judge_name":           judge_name,
-                    "section":              ex["excasetype"],
-                    "district":             None,
                     "prayer":               ex.get("case_remarks") or None,
-                    "last_hearing_or_stage": stage_name,
-                    "counsel_name":         ex.get("petitioner_adv"),
-                    "raw_text":             ET.tostring(case, encoding="unicode"),
-                    "raw_data":             {
-                        "excasetype":     ex["excasetype"],
-                        "excaseno":       ex["excaseno"],
-                        "excaseyr":       ex["excaseyr"],
-                        "expadv":         ex.get("petitioner_adv"),
-                        "exradv":         ex.get("respondent_adv"),
-                        "case_remarks":   ex.get("case_remarks"),
-                        "parent_case":    case_number,
-                        "is_extra":       True,
-                    },
-                    "import_status":        "imported",
+                    "stage_status":         stage_name,
                     "updated_at":           datetime.datetime.now(datetime.UTC).isoformat(),
                 })
 
@@ -890,13 +910,11 @@ supabase.table("daily_cause_list") \
     .execute()
 log('Old records cleared.', 'db')
 
+inserted_daily = 0
 for batch in chunk_list(deduped_rows, 500):
-    supabase.table("daily_cause_list").upsert(
-        batch,
-        on_conflict="cause_date,court_hall,item_number,case_number"
-    ).execute()
+    inserted_daily += _safe_upsert_daily_cause_batch(batch)
 
-log(f'Inserted/Updated : {len(deduped_rows)} rows', 'db')
+log(f'Inserted/Updated : {inserted_daily} rows', 'db')
 
 # ── Step 2: Match cause list against tracked cases, enrich, and notify ─────────
 run_matching_pipeline(db_date)

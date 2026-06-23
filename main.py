@@ -1045,12 +1045,6 @@ def save_vc_links(vc_date: str, vc_rows: List[Dict[str, Optional[str]]]) -> int:
         for row in vc_rows
     ]
 
-    log(f'Clearing existing VC rows for {vc_date}...', 'vc')
-    supabase.table("vc_links") \
-        .delete() \
-        .eq("vc_date", vc_date) \
-        .execute()
-
     inserted = 0
     for batch in chunk_list(payload, 500):
         inserted += _safe_insert_vc_links_batch(batch)
@@ -1066,6 +1060,26 @@ def chunk_list(items, size):
 log_section(f'STEP 0 — Script start  ({_SCRIPT_START.strftime("%Y-%m-%d %H:%M:%S IST")})')
 log(f'Target date : {db_date}', 'init')
 log(f'XML URL     : {url}', 'init')
+
+log_section('STEP 0a — Clear today\'s data from all tables')
+try:
+    log(f'Clearing today_matched_listings for {db_date}...', 'init')
+    supabase.table('today_matched_listings').delete().eq('listed_date', db_date).execute()
+    log('today_matched_listings cleared.', 'init')
+except Exception as exc:
+    log(f'today_matched_listings clear error (non-fatal): {exc}', 'init')
+try:
+    log(f'Clearing daily_cause_list for {db_date}...', 'init')
+    supabase.table('daily_cause_list').delete().eq('cause_date', db_date).execute()
+    log('daily_cause_list cleared.', 'init')
+except Exception as exc:
+    log(f'daily_cause_list clear error (non-fatal): {exc}', 'init')
+try:
+    log(f'Clearing vc_links for {db_date}...', 'init')
+    supabase.table('vc_links').delete().eq('vc_date', db_date).execute()
+    log('vc_links cleared.', 'init')
+except Exception as exc:
+    log(f'vc_links clear error (non-fatal): {exc}', 'init')
 
 log_section('STEP 1 — Download MHC cause list XML')
 xml_content = download_xml(url)
@@ -1196,12 +1210,6 @@ if not deduped_rows:
     exit(0)
 
 log_section('STEP 3 — Write to Supabase daily_cause_list')
-log(f'Clearing existing rows for {db_date}...', 'db')
-supabase.table("daily_cause_list") \
-    .delete() \
-    .eq("cause_date", db_date) \
-    .execute()
-log('Old records cleared.', 'db')
 
 inserted_daily = 0
 for batch in chunk_list(deduped_rows, 500):

@@ -1052,7 +1052,7 @@ def save_vc_links(vc_date: str, vc_rows: List[Dict[str, Optional[str]]]) -> int:
     return inserted
 
 
-def chunk_list(items, size):
+def chunk_list(items, size):s
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
@@ -1063,20 +1063,20 @@ log(f'XML URL     : {url}', 'init')
 
 log_section('STEP 0a — Clear today\'s data from all tables')
 try:
-    log(f'Clearing today_matched_listings for {db_date}...', 'init')
-    supabase.table('today_matched_listings').delete().eq('listed_date', db_date).execute()
+    log('Clearing ALL rows from today_matched_listings...', 'init')
+    supabase.table('today_matched_listings').delete().gte('listed_date', '2000-01-01').execute()
     log('today_matched_listings cleared.', 'init')
 except Exception as exc:
     log(f'today_matched_listings clear error (non-fatal): {exc}', 'init')
 try:
-    log(f'Clearing daily_cause_list for {db_date}...', 'init')
-    supabase.table('daily_cause_list').delete().eq('cause_date', db_date).execute()
+    log('Clearing ALL rows from daily_cause_list...', 'init')
+    supabase.table('daily_cause_list').delete().gte('cause_date', '2000-01-01').execute()
     log('daily_cause_list cleared.', 'init')
 except Exception as exc:
     log(f'daily_cause_list clear error (non-fatal): {exc}', 'init')
 try:
-    log(f'Clearing vc_links for {db_date}...', 'init')
-    supabase.table('vc_links').delete().eq('vc_date', db_date).execute()
+    log('Clearing ALL rows from vc_links...', 'init')
+    supabase.table('vc_links').delete().gte('vc_date', '2000-01-01').execute()
     log('vc_links cleared.', 'init')
 except Exception as exc:
     log(f'vc_links clear error (non-fatal): {exc}', 'init')

@@ -27,3 +27,12 @@ Traceback (most recent call last):
     return codecs.charmap_encode(input,self.errors,encoding_table)[0]
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 UnicodeEncodeError: 'charmap' codec can't encode characters in position 2-59: character maps to <undefined>
+Traceback (most recent call last):
+  File "C:\Users\Afrose Ahamed\OneDrive\Desktop\mhc-causelist-automation\main.py", line 1060, in <module>
+    log_section(f'STEP 0 — Script start  ({_SCRIPT_START.strftime("%Y-%m-%d %H:%M:%S IST")})')
+  File "C:\Users\Afrose Ahamed\OneDrive\Desktop\mhc-causelist-automation\main.py", line 31, in log_section
+    print(f'\n\u250c{bar}\u2510', flush=True)
+  File "C:\Users\Afrose Ahamed\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 2-59: character maps to <undefined>

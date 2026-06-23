@@ -1052,7 +1052,7 @@ def save_vc_links(vc_date: str, vc_rows: List[Dict[str, Optional[str]]]) -> int:
     return inserted
 
 
-def chunk_list(items, size):s
+def chunk_list(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 

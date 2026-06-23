@@ -56,7 +56,7 @@ BASE_MATCH_COLS  = frozenset({
     'listed_date',
     'case_id', 'daily_cause_list_id',
     'case_number', 'court_hall', 'item_number',
-    'judge_name', 'stage', 'petitioner', 'respondent',
+    'judge_name', 'vc_link', 'stage', 'petitioner', 'respondent',
     'notification_status', 'created_at', 'updated_at',
 })
 _MONTHS = {
@@ -181,6 +181,10 @@ def normalize_case_number(s: Optional[str]) -> str:
 def _is_for_admission(stage: Optional[str]) -> bool:
     normal = re.sub(r'\s+', ' ', (stage or '').strip().upper())
     return normal == 'FOR ADMISSION'
+
+
+def normalize_judge_name(name: Optional[str]) -> str:
+    return ' '.join(str(name or '').upper().split())
 
 
 def _build_case_index(cases: List[Dict]) -> Dict[str, Dict]:
@@ -663,6 +667,36 @@ def _safe_upsert_daily_cause_batch(batch: List[Dict]) -> int:
     return 0
 
 
+def _safe_insert_vc_links_batch(batch: List[Dict]) -> int:
+    def _normalise_keys(rows: List[Dict]) -> List[Dict]:
+        all_keys: set = set()
+        for r in rows:
+            all_keys.update(r.keys())
+        return [{k: r.get(k) for k in all_keys} for r in rows]
+
+    working_batch = list(batch)
+    for _ in range(20):
+        try:
+            supabase.table("vc_links").insert(
+                _normalise_keys(working_batch)
+            ).execute()
+            return len(working_batch)
+        except Exception as exc:
+            msg = str(exc)
+            m = re.search(r"find the '(\w+)' column", msg)
+            if not m:
+                m = re.search(r"column [\"']?(\w+)[\"']?", msg)
+            if m:
+                missing = m.group(1)
+                log(f"vc_links missing column {missing!r} - stripping and retrying.", 'vc')
+                working_batch = [{k: v for k, v in row.items() if k != missing} for row in working_batch]
+                continue
+            raise
+
+    log('vc_links insert failed after repeated missing-column retries.', 'vc')
+    return 0
+
+
 # ── Cases master-record sync ───────────────────────────────────────────────────
 
 def _derive_case_patch(match: Dict, today_str: str) -> Optional[Dict]:
@@ -737,9 +771,10 @@ def _sync_cases_table(enriched_matches: List[Dict]) -> int:
 
 # ── Main matching + enrichment + notification pipeline ─────────────────────────
 
-def run_matching_pipeline(listed_date: str) -> None:
+def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] = None) -> None:
     """Match cause list rows by case-number or CLA party text and enrich from eCourts."""
     t0 = time.monotonic()
+    vc_lookup = vc_lookup or {}
     try:
         log_section('STEP 1 — Fetch daily cause list')
         cause_list = _fetch_all('daily_cause_list', {
@@ -802,6 +837,12 @@ def run_matching_pipeline(listed_date: str) -> None:
             log(f'MATCH ({match_type})  CL={cl.get("case_number")!r} CASE={case_number_value!r} CNR={case_cnr!r}', 'match')
 
             item_raw = cl.get('item_number')
+            normalized_judge = normalize_judge_name(cl.get('judge_name'))
+            vc_link = vc_lookup.get(normalized_judge)
+            if vc_link:
+                log(f'VC Link matched for {cl.get("judge_name")}', 'vc')
+            else:
+                log(f'No VC Link found for {cl.get("judge_name")}', 'vc')
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             base_matches.append({
                 'listed_date':         listed_date,
@@ -811,6 +852,7 @@ def run_matching_pipeline(listed_date: str) -> None:
                 'court_hall':          cl.get('court_hall'),
                 'item_number':         str(item_raw).strip() if item_raw is not None else None,
                 'judge_name':          cl.get('judge_name'),
+                'vc_link':             vc_link,
                 'stage':               cl.get('stage_status'),
                 'petitioner':          cl.get('petitioner'),
                 'respondent':          cl.get('respondent'),
@@ -844,7 +886,7 @@ def run_matching_pipeline(listed_date: str) -> None:
         log(f'Pipeline error: {exc}', 'match')
 
 
-today = datetime.datetime.now(IST).date()
+today = datetime.datetime.now(IST).date() + datetime.timedelta(days=1)
 # For testing:
 # today = datetime.date(2026, 6, 13)
 
@@ -908,6 +950,112 @@ def download_xml(url):
     log('Failed to download XML after all retries.', 'download')
     log(f'Last error: {last_error}', 'download')
     return None
+
+
+def fetch_vc_links(vc_date: str) -> List[Dict[str, Optional[str]]]:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+        "Referer": "https://www.mhc.tn.gov.in/vclink/",
+    })
+
+    last_error = None
+
+    for attempt in range(1, 8):
+        try:
+            log(f'Attempt {attempt}/7  vc_date={vc_date}', 'vc')
+            response = session.post(
+                'https://www.mhc.tn.gov.in/vclink/datareport.php',
+                data={
+                    'bench': '1',
+                    'cdate': vc_date,
+                },
+                timeout=60,
+                verify=False,
+            )
+
+            log(f'HTTP {response.status_code}  Content-Type: {response.headers.get("Content-Type")}', 'vc')
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            vc_rows: List[Dict[str, Optional[str]]] = []
+
+            for tr in soup.find_all('tr'):
+                cells = tr.find_all('td')
+                if len(cells) < 3:
+                    continue
+
+                bench_no = _cell_text(cells[0].get_text(' ', strip=True))
+                judge_name = _cell_text(cells[1].get_text(' ', strip=True))
+                anchor = cells[2].find('a', href=True)
+                vc_link = anchor['href'].strip() if anchor and anchor.get('href') else ''
+
+                if not bench_no or not judge_name or not vc_link:
+                    continue
+
+                vc_rows.append({
+                    'bench_no': bench_no,
+                    'judge_name': judge_name,
+                    'vc_link': vc_link,
+                })
+
+            return vc_rows
+
+        except Exception as error:
+            last_error = error
+            log(f'Attempt {attempt} failed: {error}', 'vc')
+
+            if attempt < 7:
+                log('Retrying in 30s...', 'vc')
+                time.sleep(30)
+
+    log('Failed to download VC links after all retries.', 'vc')
+    log(f'Last error: {last_error}', 'vc')
+    return []
+
+
+def build_vc_lookup(vc_rows: List[Dict[str, Optional[str]]]) -> Dict[str, str]:
+    vc_lookup: Dict[str, str] = {}
+    for row in vc_rows:
+        normalized_judge = normalize_judge_name(row.get('judge_name'))
+        vc_link = (row.get('vc_link') or '').strip()
+        if not normalized_judge or not vc_link:
+            continue
+        vc_lookup[normalized_judge] = vc_link
+    return vc_lookup
+
+
+def save_vc_links(vc_date: str, vc_rows: List[Dict[str, Optional[str]]]) -> int:
+    now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+    payload = [
+        {
+            'vc_date': vc_date,
+            'bench_no': row.get('bench_no'),
+            'judge_name': row.get('judge_name'),
+            'vc_link': row.get('vc_link'),
+            'created_at': now_iso,
+        }
+        for row in vc_rows
+    ]
+
+    log(f'Clearing existing VC rows for {vc_date}...', 'vc')
+    supabase.table("vc_links") \
+        .delete() \
+        .eq("vc_date", vc_date) \
+        .execute()
+
+    inserted = 0
+    for batch in chunk_list(payload, 500):
+        inserted += _safe_insert_vc_links_batch(batch)
+
+    return inserted
 
 
 def chunk_list(items, size):
@@ -1061,5 +1209,12 @@ for batch in chunk_list(deduped_rows, 500):
 
 log(f'Inserted/Updated : {inserted_daily} rows', 'db')
 
+log_section('STEP 4 — Download VC Links')
+vc_rows = fetch_vc_links(db_date)
+vc_lookup = build_vc_lookup(vc_rows)
+log(f'VC rows found : {len(vc_rows)}', 'vc')
+inserted_vc = save_vc_links(db_date, vc_rows)
+log(f'Inserted VC rows : {inserted_vc}', 'vc')
+
 # ── Step 2: Match cause list against tracked cases, enrich, and notify ─────────
-run_matching_pipeline(db_date)
+run_matching_pipeline(db_date, vc_lookup)

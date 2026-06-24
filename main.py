@@ -726,7 +726,7 @@ def _safe_upsert_daily_cause_batch(batch: List[Dict]) -> int:
 
     log('daily_cause_list upsert failed after repeated missing-column retries.', 'db')
     return 0
- 
+
 
 def _safe_insert_vc_links_batch(batch: List[Dict]) -> int:
     def _normalise_keys(rows: List[Dict]) -> List[Dict]:
@@ -968,7 +968,8 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
 
 
 today = datetime.datetime.now(IST).date() + datetime.timedelta(days=1)
-
+# For testing:
+today = datetime.date(2026, 6, 23)
 
 # If today is Saturday (5) or Sunday (6), advance to the next Monday
 if today.weekday() == 5:  # Saturday

@@ -12,7 +12,9 @@ from bs4 import BeautifulSoup
 from supabase import create_client
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+print("=" * 60)
+print("MHC Cause List Sync Started")
+print("=" * 60)
 # ── Timeline logger ────────────────────────────────────────────────────────────
 _IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 _SCRIPT_START = datetime.datetime.now(_IST_TZ)
@@ -175,13 +177,28 @@ def _fetch_all_cases_for_existence() -> List[Dict]:
 def _load_org_id_map() -> Dict[str, str]:
     """Fetch the organizations table and return a {name: id} lookup map.
 
-    Only master-data columns (name, id, active) are fetched.  Detection
-    keywords are never stored in the DB — they live in ORG_PATTERNS above.
-    Returns an empty dict on any error so the pipeline continues gracefully.
+    The organizations table exposes master data via ``organization_name`` and
+    ``short_name`` (there is no ``name`` column).  Both are indexed — lowercased
+    and stripped — so a detected organization name can be mapped to its id
+    regardless of which label the cause list text resembles.  Detection keywords
+    are never stored in the DB — they live in ORG_PATTERNS above.  Returns an
+    empty dict on any error so the pipeline continues gracefully.
     """
     try:
-        orgs = _fetch_all('organizations', {'select': 'id,name', 'active': 'eq.true'})
-        return {o['name']: o['id'] for o in orgs if o.get('name') and o.get('id')}
+        orgs = _fetch_all('organizations', {
+            'select': 'id,organization_name,short_name',
+            'active': 'eq.true',
+        })
+        id_map: Dict[str, str] = {}
+        for o in orgs:
+            oid = o.get('id')
+            if not oid:
+                continue
+            for label in (o.get('organization_name'), o.get('short_name')):
+                if label:
+                    id_map[str(label).strip().lower()] = oid
+        log(f'Organizations loaded: {len(orgs)} (lookup keys: {len(id_map)})', 'org')
+        return id_map
     except Exception as exc:
         log(f'Failed to load organizations (non-fatal): {exc}', 'org')
         return {}
@@ -793,6 +810,7 @@ def _safe_patch_case(case_id: str, patch: Dict) -> bool:
         )
 
     r = _do(patch)
+    log(f'PATCH cases id={case_id} -> HTTP {r.status_code}  body={r.text[:200]!r}', 'sync')
     if r.ok:
         return True
 
@@ -819,19 +837,61 @@ def _safe_patch_case(case_id: str, patch: Dict) -> bool:
 def _sync_cases_table(enriched_matches: List[Dict]) -> int:
     today_str = datetime.datetime.now(IST).date().isoformat()
     updated = 0
+    skipped_no_case_id = 0
+    skipped_empty_patch = 0
+    failed = 0
     for match in enriched_matches:
         case_id = match.get('case_id')
+        case_number = match.get('case_number')
+        org_id = match.get('organization_id')
+
+        # Issue 4: log every matched case so the update path is fully traceable.
         if not case_id:
+            skipped_no_case_id += 1
+            log(
+                f'case update SKIPPED (no case_id)  case_number={case_number!r}  '
+                f'organization_id={org_id!r}',
+                'sync',
+            )
             continue
         patch = _derive_case_patch(match, today_str)
         if not patch:
+            skipped_empty_patch += 1
+            log(
+                f'case update SKIPPED (empty patch)  case_id={case_id}  '
+                f'case_number={case_number!r}  organization_id={org_id!r}',
+                'sync',
+            )
             continue
+        log(
+            f'case update ATTEMPT  case_id={case_id}  case_number={case_number!r}  '
+            f'organization_id={org_id!r}  payload={patch}',
+            'sync',
+        )
         try:
             if _safe_patch_case(case_id, patch):
                 updated += 1
-                log(f'case updated id={case_id}  status={patch.get("case_status")!r}  nhd={patch.get("next_hearing_date")!r}', 'sync')
+                log(
+                    f'case update OK  case_id={case_id}  case_number={case_number!r}  '
+                    f'organization_id={org_id!r}  status={patch.get("case_status")!r}',
+                    'sync',
+                )
+            else:
+                failed += 1
+                log(
+                    f'case update FAILED  case_id={case_id}  case_number={case_number!r}  '
+                    f'organization_id={org_id!r}',
+                    'sync',
+                )
         except Exception as exc:
-            log(f'cases update error case_id={case_id}: {exc}', 'sync')
+            failed += 1
+            log(f'case update ERROR  case_id={case_id}  case_number={case_number!r}: {exc}', 'sync')
+    log(
+        f'cases sync summary: matches={len(enriched_matches)}  updated={updated}  '
+        f'failed={failed}  skipped_no_case_id={skipped_no_case_id}  '
+        f'skipped_empty_patch={skipped_empty_patch}',
+        'sync',
+    )
     return updated
 
 
@@ -864,7 +924,8 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
         log(f'Total cases for existence check: {len(all_cases)}', 'match')
 
         org_id_map = _load_org_id_map()
-        log(f'Organizations loaded for detection: {len(org_id_map)}', 'org')
+        if not org_id_map:
+            log('WARNING: no organizations loaded - detected orgs cannot be mapped to ids', 'org')
 
         log_section('STEP 3 — Build active-case lookup')
         case_by_norm = _build_case_index(cases)
@@ -915,8 +976,17 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
 
             # ── Organization detection (in-memory, no DB query per row) ──
             detected_org = _detect_org_name(cl)
-            org_id = org_id_map.get(detected_org) if detected_org else None
-            if detected_org:
+            org_id = org_id_map.get(detected_org.strip().lower()) if detected_org else None
+            if detected_org and not org_id:
+                # Issue 5: detection succeeded but mapping to organizations.id
+                # failed — warn and keep processing the listing.
+                log(
+                    f'WARNING: organization detected {detected_org!r} but no matching '
+                    f'organizations.id found (mapping failed); continuing  '
+                    f'case={case_number_value!r}',
+                    'org',
+                )
+            elif detected_org:
                 log(
                     f'Org detected: {detected_org!r}  org_id={org_id!r}'
                     f'  case={case_number_value!r}',
@@ -1306,3 +1376,6 @@ log(f'Inserted VC rows : {inserted_vc}', 'vc')
 
 # ── Step 2: Match cause list against tracked cases, enrich, and notify ─────────
 run_matching_pipeline(db_date, vc_lookup)
+print("=" * 60)
+print("MHC Cause List Sync Completed Successfully")
+print("=" * 60)

@@ -12,12 +12,20 @@ from bs4 import BeautifulSoup
 from supabase import create_client
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-print("=" * 60)
-print("MHC Cause List Sync Started")
-print("=" * 60)
 # ── Timeline logger ────────────────────────────────────────────────────────────
 _IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 _SCRIPT_START = datetime.datetime.now(_IST_TZ)
+
+
+def _reset_script_timer() -> None:
+    global _SCRIPT_START
+    _SCRIPT_START = datetime.datetime.now(_IST_TZ)
+
+
+def _print_banner(title: str) -> None:
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
 
 def log(msg: str, step: str = '') -> None:
     now      = datetime.datetime.now(_IST_TZ)
@@ -50,6 +58,7 @@ ECOURTS_TIMEOUT  = (5, 20)
 ECOURTS_WORKERS  = 5
 ECOURTS_BUDGET_S = 45
 ECOURTS_RETRIES  = 3
+VC_REFRESH_INTERVAL_S = 600
 # ── Organization detection patterns (kept in code — not in DB) ────────────────
 # These are system-level matching rules. Detection keywords live here;
 # master data (credits, plans, contacts) stays in the organizations table.
@@ -1046,19 +1055,6 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
         log(f'Pipeline error: {exc}', 'match')
 
 
-today = datetime.datetime.now(IST).date() + datetime.timedelta(days=1)
-
-# If today is Saturday (5) or Sunday (6), advance to the next Monday
-if today.weekday() == 5:  # Saturday
-    today += datetime.timedelta(days=2)
-elif today.weekday() == 6:  # Sunday
-    today += datetime.timedelta(days=1)
-
-file_date = today.strftime("%d%m%Y")
-db_date = today.strftime("%Y-%m-%d")
-
-url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
-
 def download_xml(url):
     session = requests.Session()
 
@@ -1215,175 +1211,244 @@ def chunk_list(items, size):
         yield items[i:i + size]
 
 
-log_section(f'STEP 0 — Script start  ({_SCRIPT_START.strftime("%Y-%m-%d %H:%M:%S IST")})')
-log(f'Target date : {db_date}', 'init')
-log(f'XML URL     : {url}', 'init')
+def _get_target_date() -> datetime.date:
+    target = datetime.datetime.now(IST).date() + datetime.timedelta(days=1)
+    if target.weekday() == 5:
+        target += datetime.timedelta(days=2)
+    elif target.weekday() == 6:
+        target += datetime.timedelta(days=1)
+    return target
 
-log_section('STEP 0a — Clear today\'s data from all tables')
-try:
-    log('Clearing ALL rows from today_matched_listings...', 'init')
-    supabase.table('today_matched_listings').delete().gte('listed_date', '2000-01-01').execute()
-    log('today_matched_listings cleared.', 'init')
-except Exception as exc:
-    log(f'today_matched_listings clear error (non-fatal): {exc}', 'init')
-try:
-    log('Clearing ALL rows from daily_cause_list...', 'init')
-    supabase.table('daily_cause_list').delete().gte('cause_date', '2000-01-01').execute()
-    log('daily_cause_list cleared.', 'init')
-except Exception as exc:
-    log(f'daily_cause_list clear error (non-fatal): {exc}', 'init')
-try:
-    log('Clearing ALL rows from vc_links...', 'init')
-    supabase.table('vc_links').delete().gte('vc_date', '2000-01-01').execute()
-    log('vc_links cleared.', 'init')
-except Exception as exc:
-    log(f'vc_links clear error (non-fatal): {exc}', 'init')
 
-log_section('STEP 1 — Download MHC cause list XML')
-xml_content = download_xml(url)
+def _get_target_context() -> Tuple[str, str]:
+    target = _get_target_date()
+    file_date = target.strftime("%d%m%Y")
+    db_date = target.strftime("%Y-%m-%d")
+    url = f"https://mhc.tn.gov.in/judis/clists/clists-madras/causelists/xml/cause_{file_date}.xml"
+    return db_date, url
 
-if not xml_content:
-    log('No XML downloaded. Existing data not deleted.', 'download')
-    exit(0)
 
-log_section('STEP 2 — Parse XML')
-try:
+def _clear_full_sync_tables() -> None:
+    log_section('STEP 0a — Clear today\'s data from all tables')
+    try:
+        log('Clearing ALL rows from today_matched_listings...', 'init')
+        supabase.table('today_matched_listings').delete().gte('listed_date', '2000-01-01').execute()
+        log('today_matched_listings cleared.', 'init')
+    except Exception as exc:
+        log(f'today_matched_listings clear error (non-fatal): {exc}', 'init')
+    try:
+        log('Clearing ALL rows from daily_cause_list...', 'init')
+        supabase.table('daily_cause_list').delete().gte('cause_date', '2000-01-01').execute()
+        log('daily_cause_list cleared.', 'init')
+    except Exception as exc:
+        log(f'daily_cause_list clear error (non-fatal): {exc}', 'init')
+    try:
+        log('Clearing ALL rows from vc_links...', 'init')
+        supabase.table('vc_links').delete().gte('vc_date', '2000-01-01').execute()
+        log('vc_links cleared.', 'init')
+    except Exception as exc:
+        log(f'vc_links clear error (non-fatal): {exc}', 'init')
+
+
+def _clear_vc_rows_for_date(db_date: str) -> None:
+    try:
+        log(f'Clearing vc_links rows for {db_date}...', 'vc')
+        supabase.table('vc_links').delete().eq('vc_date', db_date).execute()
+        log(f'vc_links rows cleared for {db_date}.', 'vc')
+    except Exception as exc:
+        log(f'vc_links targeted clear error (non-fatal): {exc}', 'vc')
+
+
+def _parse_daily_cause_rows(xml_content: str, db_date: str) -> List[Dict[str, Any]]:
     root = ET.fromstring(xml_content)
-except ET.ParseError as error:
-    log(f'XML parsing failed: {error}', 'parse')
-    log('Existing data not deleted.', 'parse')
-    exit(0)
+    rows: List[Dict[str, Any]] = []
 
-rows = []
+    for court in root.findall(".//court"):
+        court_hall = court.findtext("courtno")
+        judge_name = court.findtext("judge1")
 
+        for stage in court.findall(".//stage"):
+            stage_name = stage.findtext("stagename")
 
-for court in root.findall(".//court"):
-    court_hall = court.findtext("courtno")
-    judge_name = court.findtext("judge1")
+            for case in stage.findall(".//casedetails"):
+                case_type = case.findtext("mcasetype")
+                case_no = case.findtext("mcaseno")
+                case_year = case.findtext("mcaseyr")
 
-    for stage in court.findall(".//stage"):
-        stage_name = stage.findtext("stagename")
+                case_number = None
+                if case_type and case_no and case_year:
+                    case_number = f"{case_type}/{case_no}/{case_year}"
 
-        for case in stage.findall(".//casedetails"):
-            case_type = case.findtext("mcasetype")
-            case_no   = case.findtext("mcaseno")
-            case_year = case.findtext("mcaseyr")
+                petitioner = case.findtext("pname")
+                respondent = case.findtext("rname")
+                serial_no = case.findtext("serial_no")
 
-            case_number = None
-            if case_type and case_no and case_year:
-                case_number = f"{case_type}/{case_no}/{case_year}"
+                raw_data = {
+                    "mcasetype": case_type,
+                    "mcaseno": case_no,
+                    "mcaseyr": case_year,
+                    "mpadv": case.findtext("mpadv"),
+                    "mradv": case.findtext("mradv"),
+                    "case_remarks": case.findtext("case_remarks"),
+                }
 
-            petitioner = case.findtext("pname")
-            respondent = case.findtext("rname")
-            serial_no  = case.findtext("serial_no")
+                extras = []
+                for extra in case.findall("extra"):
+                    ex_type = extra.findtext("excasetype")
+                    ex_no = extra.findtext("excaseno")
+                    ex_year = extra.findtext("excaseyr")
+                    ex_case_number = None
+                    if ex_type and ex_no and ex_year:
+                        ex_case_number = f"{ex_type}/{ex_no}/{ex_year}"
+                    extras.append({
+                        "case_number": ex_case_number,
+                        "excasetype": ex_type,
+                        "excaseno": ex_no,
+                        "excaseyr": ex_year,
+                        "petitioner": extra.findtext("expname"),
+                        "respondent": extra.findtext("exrname"),
+                        "petitioner_adv": extra.findtext("expadv"),
+                        "respondent_adv": extra.findtext("exradv"),
+                        "case_remarks": extra.findtext("excaseremarks"),
+                    })
 
-            # ── Build the raw_data dict for the main case ──────────────────
-            raw_data = {
-                "mcasetype":    case_type,
-                "mcaseno":      case_no,
-                "mcaseyr":      case_year,
-                "mpadv":        case.findtext("mpadv"),
-                "mradv":        case.findtext("mradv"),
-                "case_remarks": case.findtext("case_remarks"),
-            }
-
-            # ── Collect <extra> linked cases ───────────────────────────────
-            extras = []
-            for extra in case.findall("extra"):
-                ex_type = extra.findtext("excasetype")
-                ex_no   = extra.findtext("excaseno")
-                ex_year = extra.findtext("excaseyr")
-                ex_case_number = None
-                if ex_type and ex_no and ex_year:
-                    ex_case_number = f"{ex_type}/{ex_no}/{ex_year}"
-                extras.append({
-                    "case_number":    ex_case_number,
-                    "excasetype":     ex_type,
-                    "excaseno":       ex_no,
-                    "excaseyr":       ex_year,
-                    "petitioner":     extra.findtext("expname"),
-                    "respondent":     extra.findtext("exrname"),
-                    "petitioner_adv": extra.findtext("expadv"),
-                    "respondent_adv": extra.findtext("exradv"),
-                    "case_remarks":   extra.findtext("excaseremarks"),
-                })
-
-            if extras:
-                raw_data["extra_cases"] = extras
-
-            rows.append({
-                "cause_date":           db_date,
-                "court_name":           "Madras High Court",
-                "bench":                "Chennai",
-                "court_hall":           court_hall,
-                "item_number":          serial_no,
-                "case_number":          case_number,
-                "petitioner":           petitioner,
-                "respondent":           respondent,
-                "judge_name":           judge_name,
-                "prayer":               raw_data.get("case_remarks") or None,
-                "stage_status":         stage_name,
-                "updated_at":           datetime.datetime.now(datetime.UTC).isoformat(),
-            })
-
-            # ── Also insert each <extra> as its own row ────────────────────
-            for idx, ex in enumerate(extras, start=1):
-                if not ex["case_number"]:
-                    continue   # skip malformed extras with no case number
+                if extras:
+                    raw_data["extra_cases"] = extras
 
                 rows.append({
-                    "cause_date":           db_date,
-                    "court_name":           "Madras High Court",
-                    "bench":                "Chennai",
-                    "court_hall":           court_hall,
-                    # extras share the parent's serial_no; suffix keeps them unique
-                    "item_number":          f"{serial_no}-E{idx}" if serial_no else None,
-                    "case_number":          ex["case_number"],
-                    "petitioner":           ex["petitioner"],
-                    "respondent":           ex["respondent"],
-                    "judge_name":           judge_name,
-                    "prayer":               ex.get("case_remarks") or None,
-                    "stage_status":         stage_name,
-                    "updated_at":           datetime.datetime.now(datetime.UTC).isoformat(),
+                    "cause_date": db_date,
+                    "court_name": "Madras High Court",
+                    "bench": "Chennai",
+                    "court_hall": court_hall,
+                    "item_number": serial_no,
+                    "case_number": case_number,
+                    "petitioner": petitioner,
+                    "respondent": respondent,
+                    "judge_name": judge_name,
+                    "prayer": raw_data.get("case_remarks") or None,
+                    "stage_status": stage_name,
+                    "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
                 })
 
-seen = {}
+                for idx, ex in enumerate(extras, start=1):
+                    if not ex["case_number"]:
+                        continue
 
-for row in rows:
-    key = (
-        row["cause_date"],
-        row["court_hall"] or "",
-        row["item_number"] or "",
-        row["case_number"] or "",
-    )
-    seen[key] = row
+                    rows.append({
+                        "cause_date": db_date,
+                        "court_name": "Madras High Court",
+                        "bench": "Chennai",
+                        "court_hall": court_hall,
+                        "item_number": f"{serial_no}-E{idx}" if serial_no else None,
+                        "case_number": ex["case_number"],
+                        "petitioner": ex["petitioner"],
+                        "respondent": ex["respondent"],
+                        "judge_name": judge_name,
+                        "prayer": ex.get("case_remarks") or None,
+                        "stage_status": stage_name,
+                        "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                    })
 
-deduped_rows = list(seen.values())
+    seen: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row["cause_date"],
+            row["court_hall"] or "",
+            row["item_number"] or "",
+            row["case_number"] or "",
+        )
+        seen[key] = row
 
-log(f'Parsed rows        : {len(rows)}', 'parse')
-log(f'Deduplicated rows  : {len(deduped_rows)}', 'parse')
+    deduped_rows = list(seen.values())
+    log(f'Parsed rows        : {len(rows)}', 'parse')
+    log(f'Deduplicated rows  : {len(deduped_rows)}', 'parse')
+    return deduped_rows
 
-if not deduped_rows:
-    log('No rows found. Existing data not deleted.', 'parse')
-    exit(0)
 
-log_section('STEP 3 — Write to Supabase daily_cause_list')
+def refresh_vc_links_only() -> int:
+    _reset_script_timer()
+    _print_banner('MHC VC Link Refresh Started')
+    db_date, _ = _get_target_context()
+    max_attempts = max(int(os.getenv('MHC_VC_REFRESH_MAX_ATTEMPTS', '0') or '0'), 0)
 
-inserted_daily = 0
-for batch in chunk_list(deduped_rows, 500):
-    inserted_daily += _safe_upsert_daily_cause_batch(batch)
+    log_section(f'STEP 0 — VC refresh start  ({_SCRIPT_START.strftime("%Y-%m-%d %H:%M:%S IST")})')
+    log(f'Target date : {db_date}', 'vc')
+    _clear_vc_rows_for_date(db_date)
 
-log(f'Inserted/Updated : {inserted_daily} rows', 'db')
+    attempt = 1
+    while True:
+        log_section(f'STEP 1 — Download VC Links (attempt {attempt})')
+        vc_rows = fetch_vc_links(db_date)
+        log(f'VC rows found : {len(vc_rows)}', 'vc')
 
-log_section('STEP 4 — Download VC Links')
-vc_rows = fetch_vc_links(db_date)
-vc_lookup = build_vc_lookup(vc_rows)
-log(f'VC rows found : {len(vc_rows)}', 'vc')
-inserted_vc = save_vc_links(db_date, vc_rows)
-log(f'Inserted VC rows : {inserted_vc}', 'vc')
+        if vc_rows:
+            vc_lookup = build_vc_lookup(vc_rows)
+            inserted_vc = save_vc_links(db_date, vc_rows)
+            log(f'Inserted VC rows : {inserted_vc}', 'vc')
 
-# ── Step 2: Match cause list against tracked cases, enrich, and notify ─────────
-run_matching_pipeline(db_date, vc_lookup)
-print("=" * 60)
-print("MHC Cause List Sync Completed Successfully")
-print("=" * 60)
+            log_section('STEP 2 — Re-run matching with refreshed VC lookup')
+            run_matching_pipeline(db_date, vc_lookup)
+            _print_banner('MHC VC Link Refresh Completed')
+            return 0
+
+        if max_attempts and attempt >= max_attempts:
+            log(
+                f'No VC rows after {attempt} attempts. Stopping due to MHC_VC_REFRESH_MAX_ATTEMPTS={max_attempts}.',
+                'vc',
+            )
+            _print_banner('MHC VC Link Refresh Stopped Without VC Rows')
+            return 1
+
+        log(f'No VC rows yet. Retrying in {VC_REFRESH_INTERVAL_S // 60} minutes...', 'vc')
+        time.sleep(VC_REFRESH_INTERVAL_S)
+        attempt += 1
+
+
+def main() -> int:
+    _reset_script_timer()
+    _print_banner('MHC Cause List Sync Started')
+    db_date, url = _get_target_context()
+
+    log_section(f'STEP 0 — Script start  ({_SCRIPT_START.strftime("%Y-%m-%d %H:%M:%S IST")})')
+    log(f'Target date : {db_date}', 'init')
+    log(f'XML URL     : {url}', 'init')
+    _clear_full_sync_tables()
+
+    log_section('STEP 1 — Download MHC cause list XML')
+    xml_content = download_xml(url)
+    if not xml_content:
+        log('No XML downloaded. Existing data not deleted.', 'download')
+        return 0
+
+    log_section('STEP 2 — Parse XML')
+    try:
+        deduped_rows = _parse_daily_cause_rows(xml_content, db_date)
+    except ET.ParseError as error:
+        log(f'XML parsing failed: {error}', 'parse')
+        log('Existing data not deleted.', 'parse')
+        return 0
+
+    if not deduped_rows:
+        log('No rows found. Existing data not deleted.', 'parse')
+        return 0
+
+    log_section('STEP 3 — Write to Supabase daily_cause_list')
+    inserted_daily = 0
+    for batch in chunk_list(deduped_rows, 500):
+        inserted_daily += _safe_upsert_daily_cause_batch(batch)
+    log(f'Inserted/Updated : {inserted_daily} rows', 'db')
+
+    log_section('STEP 4 — Download VC Links')
+    vc_rows = fetch_vc_links(db_date)
+    vc_lookup = build_vc_lookup(vc_rows)
+    log(f'VC rows found : {len(vc_rows)}', 'vc')
+    inserted_vc = save_vc_links(db_date, vc_rows)
+    log(f'Inserted VC rows : {inserted_vc}', 'vc')
+
+    run_matching_pipeline(db_date, vc_lookup)
+    _print_banner('MHC Cause List Sync Completed Successfully')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

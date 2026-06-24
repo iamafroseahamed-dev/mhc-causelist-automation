@@ -726,7 +726,7 @@ def _safe_upsert_daily_cause_batch(batch: List[Dict]) -> int:
 
     log('daily_cause_list upsert failed after repeated missing-column retries.', 'db')
     return 0
-
+ 
 
 def _safe_insert_vc_links_batch(batch: List[Dict]) -> int:
     def _normalise_keys(rows: List[Dict]) -> List[Dict]:

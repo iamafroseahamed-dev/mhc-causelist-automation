@@ -6,4 +6,7 @@ if not exist logs mkdir logs
 
 call .venv\Scripts\activate
 
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 python mhc_causelist_automation.py >> logs\cause_list_%date:~-4%%date:~4,2%%date:~7,2%.log 2>&1

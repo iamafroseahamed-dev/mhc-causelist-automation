@@ -1376,11 +1376,7 @@ inserted_vc = save_vc_links(db_date, vc_rows)
 log(f'Inserted VC rows : {inserted_vc}', 'vc')
 
 # ── Step 2: Match cause list against tracked cases, enrich, and notify ─────────
-<<<<<<< HEAD:mhc_causelist_automation.py
 run_matching_pipeline(db_date, vc_lookup)
 print("=" * 60)
 print("MHC Cause List Sync Completed Successfully")
 print("=" * 60)
-=======
-run_matching_pipeline(db_date, vc_lookup)
->>>>>>> d570edd20960a20d246ea61bd95c0b773f554e99:main.py

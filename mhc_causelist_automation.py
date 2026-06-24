@@ -245,7 +245,16 @@ def _is_for_admission(stage: Optional[str]) -> bool:
 
 
 def normalize_judge_name(name: Optional[str]) -> str:
-    return ' '.join(str(name or '').upper().split())
+    normalized = str(name or '').upper()
+    normalized = normalized.replace('&AMP;', '&')
+    normalized = re.sub(r'[^A-Z0-9&\s]', ' ', normalized)
+    normalized = re.sub(
+        r'\b(THE|HONOURABLE|HON BLE|HONBLE|HON|MR|MRS|MS|DR|JUSTICE|CJ|CHIEF)\b',
+        ' ',
+        normalized,
+    )
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized
 
 
 def _build_case_index(cases: List[Dict]) -> Dict[str, Dict]:

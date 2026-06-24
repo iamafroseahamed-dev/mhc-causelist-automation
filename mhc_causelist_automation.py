@@ -1038,8 +1038,6 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
 
 
 today = datetime.datetime.now(IST).date() + datetime.timedelta(days=1)
-# For testing:
-today = datetime.date(2026, 6, 23)
 
 # If today is Saturday (5) or Sunday (6), advance to the next Monday
 if today.weekday() == 5:  # Saturday

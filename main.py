@@ -48,16 +48,45 @@ ECOURTS_TIMEOUT  = (5, 20)
 ECOURTS_WORKERS  = 5
 ECOURTS_BUDGET_S = 45
 ECOURTS_RETRIES  = 3
-CLA_PATTERNS     = (
-    'the commissioner of land administration',
-    'land administration department',
-)
+# ── Organization detection patterns (kept in code — not in DB) ────────────────
+# These are system-level matching rules. Detection keywords live here;
+# master data (credits, plans, contacts) stays in the organizations table.
+ORG_PATTERNS: Dict[str, List[str]] = {
+    "Commissioner of Land Administration": [
+        "the commissioner of land administration",
+        "commissioner of land administration",
+        "land administration department",
+        "commissioner land administration",
+        "cla",
+    ],
+    "Revenue Department": [
+        "district revenue officer",
+        "revenue department",
+        "tahsildar",
+        "rdo",
+        "collector",
+    ],
+    "Police Department": [
+        "commissioner of police",
+        "superintendent of police",
+        "inspector of police",
+        "police department",
+    ],
+    "Transport Department": [
+        "transport commissioner",
+        "regional transport officer",
+        "rto",
+        "transport department",
+    ],
+}
+# Backward-compatible alias used by existing CLA matching logic.
+CLA_PATTERNS = tuple(ORG_PATTERNS["Commissioner of Land Administration"])
 BASE_MATCH_COLS  = frozenset({
     'listed_date',
     'case_id', 'daily_cause_list_id',
     'case_number', 'court_hall', 'item_number',
     'judge_name', 'vc_link', 'stage', 'petitioner', 'respondent',
-    'notification_status', 'created_at', 'updated_at',
+    'notification_status', 'organization_id', 'created_at', 'updated_at',
 })
 _MONTHS = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
@@ -141,6 +170,21 @@ def _fetch_all_cases_for_existence() -> List[Dict]:
     if last_error:
         raise last_error
     return []
+
+
+def _load_org_id_map() -> Dict[str, str]:
+    """Fetch the organizations table and return a {name: id} lookup map.
+
+    Only master-data columns (name, id, active) are fetched.  Detection
+    keywords are never stored in the DB — they live in ORG_PATTERNS above.
+    Returns an empty dict on any error so the pipeline continues gracefully.
+    """
+    try:
+        orgs = _fetch_all('organizations', {'select': 'id,name', 'active': 'eq.true'})
+        return {o['name']: o['id'] for o in orgs if o.get('name') and o.get('id')}
+    except Exception as exc:
+        log(f'Failed to load organizations (non-fatal): {exc}', 'org')
+        return {}
 
 
 # ── Case-number normalisation ──────────────────────────────────────────────────
@@ -479,6 +523,7 @@ def _build_party_search_text(cl_row: Dict) -> str:
         _to_text(cl_row.get('petitioner')),
         _to_text(cl_row.get('respondent')),
         _to_text(cl_row.get('prayer')),
+        _to_text(cl_row.get('subject_matter')),
         _to_text(cl_row.get('stage_status')),
     ]
 
@@ -487,7 +532,23 @@ def _build_party_search_text(cl_row: Dict) -> str:
 
 def _is_land_admin_match(cl_row: Dict) -> bool:
     text = _build_party_search_text(cl_row)
-    return any(pattern in text for pattern in CLA_PATTERNS)
+    return any(pattern in text for pattern in ORG_PATTERNS["Commissioner of Land Administration"])
+
+
+def _detect_org_name(cl_row: Dict) -> Optional[str]:
+    """Return the highest-confidence organization name matching the row text, or None.
+
+    Iterates ORG_PATTERNS in definition order (priority order).  The first
+    organization whose keyword appears in the combined search text wins.
+    Keywords are matched in lowercase against the full text blob so no
+    database query is needed.
+    """
+    text = _build_party_search_text(cl_row)
+    for org_name, keywords in ORG_PATTERNS.items():
+        for kw in keywords:
+            if kw in text:
+                return org_name
+    return None
 
 
 def _run_hearing_history_post(ecourts_case_no: str, cnr_number: str) -> requests.Response:
@@ -713,6 +774,11 @@ def _derive_case_patch(match: Dict, today_str: str) -> Optional[Dict]:
         patch['case_status'] = stage_status
         patch['last_hearing_update'] = stage_status
 
+    # Propagate detected organization to the cases master record.
+    org_id = match.get('organization_id')
+    if org_id:
+        patch['organization_id'] = org_id
+
     substantive = set(patch) - {'updated_at'}
     return patch if substantive else None
 
@@ -797,6 +863,9 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
         all_cases = _fetch_all_cases_for_existence()
         log(f'Total cases for existence check: {len(all_cases)}', 'match')
 
+        org_id_map = _load_org_id_map()
+        log(f'Organizations loaded for detection: {len(org_id_map)}', 'org')
+
         log_section('STEP 3 — Build active-case lookup')
         case_by_norm = _build_case_index(cases)
         case_exists_by_norm = _build_case_index(all_cases)
@@ -843,6 +912,17 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
                 log(f'VC Link matched for {cl.get("judge_name")}', 'vc')
             else:
                 log(f'No VC Link found for {cl.get("judge_name")}', 'vc')
+
+            # ── Organization detection (in-memory, no DB query per row) ──
+            detected_org = _detect_org_name(cl)
+            org_id = org_id_map.get(detected_org) if detected_org else None
+            if detected_org:
+                log(
+                    f'Org detected: {detected_org!r}  org_id={org_id!r}'
+                    f'  case={case_number_value!r}',
+                    'org',
+                )
+
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             base_matches.append({
                 'listed_date':         listed_date,
@@ -857,6 +937,7 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
                 'petitioner':          cl.get('petitioner'),
                 'respondent':          cl.get('respondent'),
                 'notification_status': 'not_notified',
+                'organization_id':     org_id,
                 'created_at':          now_iso,
                 'updated_at':          now_iso,
             })

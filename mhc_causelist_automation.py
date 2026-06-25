@@ -1036,6 +1036,10 @@ def run_matching_pipeline(listed_date: str, vc_lookup: Optional[Dict[str, str]] 
             return
 
         log_section('STEP 5 — Upsert listing rows')
+        # Clear this date's rows first so re-runs (e.g. VC refresh) stay idempotent.
+        # Rows with NULL case_id never trigger upsert conflict resolution, so without
+        # this they would accumulate as duplicates on every re-run.
+        _clear_matched_listings_for_date(listed_date)
         inserted = 0
         for i in range(0, len(base_matches), BATCH_SIZE):
             inserted += _safe_upsert_batch(base_matches[i:i + BATCH_SIZE])
@@ -1177,12 +1181,29 @@ def fetch_vc_links(vc_date: str) -> List[Dict[str, Optional[str]]]:
 
 def build_vc_lookup(vc_rows: List[Dict[str, Optional[str]]]) -> Dict[str, str]:
     vc_lookup: Dict[str, str] = {}
+
+    # Pass 1 — index the full normalized bench name (exact match, highest priority).
     for row in vc_rows:
         normalized_judge = normalize_judge_name(row.get('judge_name'))
         vc_link = (row.get('vc_link') or '').strip()
         if not normalized_judge or not vc_link:
             continue
         vc_lookup[normalized_judge] = vc_link
+
+    # Pass 2 — for Division Benches ("JUDGE A AND JUDGE B"), also index each
+    # individual judge so a cause list that lists only one judge still resolves
+    # to that bench's VC link. Existing keys are never overwritten, so exact
+    # single-judge entries always win over a split fallback.
+    for row in vc_rows:
+        normalized_judge = normalize_judge_name(row.get('judge_name'))
+        vc_link = (row.get('vc_link') or '').strip()
+        if not normalized_judge or not vc_link or ' AND ' not in normalized_judge:
+            continue
+        for part in normalized_judge.split(' AND '):
+            part = part.strip()
+            if part and part not in vc_lookup:
+                vc_lookup[part] = vc_link
+
     return vc_lookup
 
 
@@ -1257,6 +1278,15 @@ def _clear_vc_rows_for_date(db_date: str) -> None:
         log(f'vc_links rows cleared for {db_date}.', 'vc')
     except Exception as exc:
         log(f'vc_links targeted clear error (non-fatal): {exc}', 'vc')
+
+
+def _clear_matched_listings_for_date(listed_date: str) -> None:
+    try:
+        log(f'Clearing today_matched_listings rows for {listed_date}...', 'match')
+        supabase.table('today_matched_listings').delete().eq('listed_date', listed_date).execute()
+        log(f'today_matched_listings rows cleared for {listed_date}.', 'match')
+    except Exception as exc:
+        log(f'today_matched_listings targeted clear error (non-fatal): {exc}', 'match')
 
 
 def _parse_daily_cause_rows(xml_content: str, db_date: str) -> List[Dict[str, Any]]:

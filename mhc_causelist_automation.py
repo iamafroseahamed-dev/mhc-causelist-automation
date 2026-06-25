@@ -509,6 +509,7 @@ def _parse_ecourts_html(html: str) -> Optional[Dict[str, Any]]:
                 'remarks':  _row_cell(row, remarks_col) if remarks_col >= 0 else '',
             })
 
+
         if hearings:
             result['hearing_history'] = hearings[:10]
             latest = hearings[0]
